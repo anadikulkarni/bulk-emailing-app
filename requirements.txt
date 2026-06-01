@@ -1,0 +1,6 @@
+streamlit
+pyodbc
+bcrypt
+python-dotenv
+dotenv
+bcrypt
