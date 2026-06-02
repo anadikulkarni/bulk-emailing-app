@@ -66,12 +66,35 @@ page = st.sidebar.radio("Navigate", pages)
 # ---------- Compose & Send ----------
 if page == "Compose & Send":
     st.header("Compose & Send")
-    rtype = st.selectbox("Retailer Type", db.get_retailer_types())
-    recipients = db.get_emails_for_type(rtype) if rtype else []
-    st.info(f"{len(recipients)} email address(es) found for **{rtype}**.")
-    with st.expander("Preview recipients"):
-        st.write(recipients)
 
+    # --- Recipient selection ---
+    recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
+
+    if recipient_mode == "Retailer Type":
+        rtype = st.selectbox("Retailer Type", db.get_retailer_types())
+        recipients = db.get_emails_for_type(rtype) if rtype else []
+        st.info(f"{len(recipients)} email address(es) found for **{rtype}**.")
+        with st.expander("Preview recipients"):
+            st.write(recipients)
+    else:
+        rtype = "CUSTOM"
+        raw = st.text_area(
+            "Enter email addresses",
+            placeholder="One per line, or comma-separated",
+            height=150,
+        )
+        # parse both newline and comma separated, strip whitespace, dedupe
+        recipients = list({
+            e.strip()
+            for e in raw.replace(",", "\n").splitlines()
+            if e.strip() and "@" in e.strip()
+        })
+        if raw and recipients:
+            st.info(f"{len(recipients)} valid email address(es) entered.")
+        elif raw and not recipients:
+            st.warning("No valid email addresses found — check formatting.")
+
+    # --- Compose ---
     subject = st.text_input("Subject")
     body = st.text_area("Message body", height=200)
     up = st.file_uploader("Attachment (optional)")
@@ -79,21 +102,21 @@ if page == "Compose & Send":
     att_bytes = up.getvalue() if up else None
 
     if st.button("Send now", type="primary", disabled=not (recipients and subject and body)):
-            import uuid
-            batch_id = str(uuid.uuid4())
-            bar = st.progress(0, text="Sending…")
-            results = send_bulk(
-                recipients, subject, body, att_name, att_bytes,
-                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
-            )
-            for addr, status, err in results:
-                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
-            sent = sum(1 for _, s, _ in results if s == "SENT")
-            st.success(f"Done. {sent}/{len(results)} sent.")
-            failed = [(a, e) for a, s, e in results if s == "FAILED"]
-            if failed:
-                st.error("Failures:")
-                st.table(failed)
+        import uuid
+        batch_id = str(uuid.uuid4())
+        bar = st.progress(0, text="Sending…")
+        results = send_bulk(
+            recipients, subject, body, att_name, att_bytes,
+            progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+        )
+        for addr, status, err in results:
+            db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
+        sent = sum(1 for _, s, _ in results if s == "SENT")
+        st.success(f"Done. {sent}/{len(results)} sent.")
+        failed = [(a, e) for a, s, e in results if s == "FAILED"]
+        if failed:
+            st.error("Failures:")
+            st.table(failed)
 
 # ---------- Activity Log ----------
 elif page == "Activity Log":
