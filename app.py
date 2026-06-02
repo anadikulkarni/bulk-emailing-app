@@ -3,7 +3,6 @@ import auth
 import db
 import os
 from emailer import send_bulk
-import pyodbc
 
 # Push Streamlit secrets into os.environ so all modules pick them up
 for key, value in st.secrets.items():
@@ -158,8 +157,3 @@ elif page == "Admin":
                 st.error("Can't delete yourself.")
             else:
                 auth.delete_user(u.username); st.rerun()
-
-
-# helper for binary param
-def pyodbc_bytes(b):
-    return pyodbc.Binary(b) if b else None
