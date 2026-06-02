@@ -3,6 +3,7 @@ import auth
 import db
 import os
 from emailer import send_bulk
+import json
 
 # Push Streamlit secrets into os.environ so all modules pick them up
 for key, value in st.secrets.items():
@@ -58,16 +59,17 @@ with st.sidebar.expander("🧪 Send test email"):
             else:
                 st.error(f"Failed: {err}")
 
-pages = ["Compose & Send", "Activity Log"]
+pages = ["Compose & Send", "Pending Sends", "Activity Log"]
 if user["role"] == "admin":
     pages.append("Admin")
 page = st.sidebar.radio("Navigate", pages)
+
+DAILY_CAP = 1800  # safely under Workspace's 2000/day limit
 
 # ---------- Compose & Send ----------
 if page == "Compose & Send":
     st.header("Compose & Send")
 
-    # --- Recipient selection ---
     recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
 
     if recipient_mode == "Retailer Type":
@@ -83,7 +85,6 @@ if page == "Compose & Send":
             placeholder="One per line, or comma-separated",
             height=150,
         )
-        # parse both newline and comma separated, strip whitespace, dedupe
         recipients = list({
             e.strip()
             for e in raw.replace(",", "\n").splitlines()
@@ -94,29 +95,140 @@ if page == "Compose & Send":
         elif raw and not recipients:
             st.warning("No valid email addresses found — check formatting.")
 
-    # --- Compose ---
     subject = st.text_input("Subject")
     body = st.text_area("Message body", height=200)
     up = st.file_uploader("Attachment (optional)")
     att_name = up.name if up else None
     att_bytes = up.getvalue() if up else None
 
-    if st.button("Send now", type="primary", disabled=not (recipients and subject and body)):
-        import uuid
-        batch_id = str(uuid.uuid4())
-        bar = st.progress(0, text="Sending…")
-        results = send_bulk(
-            recipients, subject, body, att_name, att_bytes,
-            progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+    over_cap = len(recipients) > DAILY_CAP
+
+    if over_cap:
+        first_batch = recipients[:DAILY_CAP]
+        remainder = recipients[DAILY_CAP:]
+        st.warning(
+            f"⚠️ {len(recipients)} recipients exceeds the daily send cap of {DAILY_CAP}. "
+            f"The first **{len(first_batch)}** will be sent now and the remaining "
+            f"**{len(remainder)}** will be saved to **Pending Sends** for tomorrow."
         )
-        for addr, status, err in results:
-            db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
-        sent = sum(1 for _, s, _ in results if s == "SENT")
-        st.success(f"Done. {sent}/{len(results)} sent.")
-        failed = [(a, e) for a, s, e in results if s == "FAILED"]
-        if failed:
-            st.error("Failures:")
-            st.table(failed)
+        if st.button("Send first 1,800 now & save remainder", type="primary",
+                     disabled=not (recipients and subject and body)):
+            import uuid
+
+            # --- Send first batch ---
+            batch_id = str(uuid.uuid4())
+            bar = st.progress(0, text="Sending…")
+            results = send_bulk(
+                first_batch, subject, body, att_name, att_bytes,
+                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+            )
+            for addr, status, err in results:
+                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
+            sent = sum(1 for _, s, _ in results if s == "SENT")
+            st.success(f"First batch done. {sent}/{len(first_batch)} sent.")
+            failed = [(a, e) for a, s, e in results if s == "FAILED"]
+            if failed:
+                st.error("Failures in first batch:")
+                st.table(failed)
+
+            # --- Save remainder ---
+            db.save_remainder(
+                label=f"{rtype} — remainder ({len(remainder)} recipients)",
+                retailer_type=rtype,
+                subject=subject,
+                body=body,
+                attachment_name=att_name,
+                attachment_bytes=att_bytes,
+                recipients=remainder,
+                created_by=user["username"],
+            )
+            st.info(f"✅ {len(remainder)} remaining recipients saved to Pending Sends.")
+    else:
+        if st.button("Send now", type="primary",
+                     disabled=not (recipients and subject and body)):
+            import uuid
+            batch_id = str(uuid.uuid4())
+            bar = st.progress(0, text="Sending…")
+            results = send_bulk(
+                recipients, subject, body, att_name, att_bytes,
+                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+            )
+            for addr, status, err in results:
+                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
+            sent = sum(1 for _, s, _ in results if s == "SENT")
+            st.success(f"Done. {sent}/{len(results)} sent.")
+            failed = [(a, e) for a, s, e in results if s == "FAILED"]
+            if failed:
+                st.error("Failures:")
+                st.table(failed)
+
+# ---------- Pending Sends ----------
+elif page == "Pending Sends":
+    st.header("Pending Sends")
+    remainders = db.get_pending_remainders()
+    if not remainders:
+        st.info("No pending sends. You're all caught up.")
+    else:
+        for r in remainders:
+            recipients = json.loads(r["recipients"])
+            with st.expander(f"📬 {r['label']} — saved {r['created_at']:%Y-%m-%d %H:%M}"):
+                st.write(f"**Subject:** {r['subject']}")
+                st.write(f"**Recipients:** {len(recipients)}")
+                st.write(f"**Saved by:** {r['created_by']}")
+                with st.expander("Preview recipients"):
+                    st.write(recipients)
+
+                over_cap = len(recipients) > DAILY_CAP
+                if over_cap:
+                    st.warning(
+                        f"This batch still has {len(recipients)} recipients — over the {DAILY_CAP} cap. "
+                        f"Sending first {DAILY_CAP} and re-saving the rest."
+                    )
+
+                btn_label = (f"Send first {DAILY_CAP} & save remainder"
+                             if over_cap else f"Send all {len(recipients)} now")
+
+                if st.button(btn_label, key=f"send_rem_{r['id']}", type="primary"):
+                    import uuid
+                    send_now = recipients[:DAILY_CAP]
+                    leftover = recipients[DAILY_CAP:]
+
+                    batch_id = str(uuid.uuid4())
+                    bar = st.progress(0, text="Sending…")
+                    att_bytes = bytes(r["attachment_data"]) if r["attachment_data"] else None
+                    results = send_bulk(
+                        send_now, r["subject"], r["body"],
+                        r["attachment_name"], att_bytes,
+                        progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+                    )
+                    for addr, status, err in results:
+                        db.log_email(None, r["retailer_type"], addr, r["subject"],
+                                     status, err, user["username"], batch_id)
+                    sent = sum(1 for _, s, _ in results if s == "SENT")
+                    st.success(f"Done. {sent}/{len(send_now)} sent.")
+                    failed = [(a, e) for a, s, e in results if s == "FAILED"]
+                    if failed:
+                        st.error("Failures:")
+                        st.table(failed)
+
+                    # mark this one done
+                    db.mark_remainder_sent(r["id"])
+
+                    # if still more left, save again
+                    if leftover:
+                        db.save_remainder(
+                            label=f"{r['retailer_type']} — remainder ({len(leftover)} recipients)",
+                            retailer_type=r["retailer_type"],
+                            subject=r["subject"],
+                            body=r["body"],
+                            attachment_name=r["attachment_name"],
+                            attachment_bytes=att_bytes,
+                            recipients=leftover,
+                            created_by=user["username"],
+                        )
+                        st.info(f"{len(leftover)} still remaining — saved back to Pending Sends.")
+
+                    st.rerun()
 
 # ---------- Activity Log ----------
 elif page == "Activity Log":

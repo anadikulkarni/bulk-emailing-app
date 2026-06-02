@@ -1,6 +1,7 @@
 import os
 import pymssql
 import streamlit as st
+import json
 
 for key, value in st.secrets.items():
     os.environ[key] = str(value)
@@ -69,3 +70,35 @@ def get_batch_detail(batch_id):
         (batch_id,)
     )
     return cursor.fetchall()
+
+def save_remainder(label, retailer_type, subject, body,
+                   attachment_name, attachment_bytes, recipients, created_by):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO PENDING_REMAINDER "
+        "(label, retailer_type, subject, body, attachment_name, attachment_data, recipients, created_by) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (label, retailer_type, subject, body, attachment_name,
+         attachment_bytes, json.dumps(recipients), created_by)
+    )
+    conn.commit()
+
+def get_pending_remainders():
+    conn = get_conn()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute(
+        "SELECT id, label, retailer_type, subject, body, "
+        "attachment_name, attachment_data, recipients, created_by, created_at "
+        "FROM PENDING_REMAINDER WHERE status = 'PENDING' ORDER BY created_at ASC"
+    )
+    return cursor.fetchall()
+
+def mark_remainder_sent(remainder_id):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE PENDING_REMAINDER SET status='SENT', sent_at=SYSDATETIME() WHERE id=%s",
+        (remainder_id,)
+    )
+    conn.commit()
