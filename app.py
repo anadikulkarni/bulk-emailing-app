@@ -58,7 +58,7 @@ with st.sidebar.expander("🧪 Send test email"):
             else:
                 st.error(f"Failed: {err}")
 
-pages = ["Compose & Send", "Email Log", "Activity Log"]
+pages = ["Compose & Send", "Activity Log"]
 if user["role"] == "admin":
     pages.append("Admin")
 page = st.sidebar.radio("Navigate", pages)
@@ -109,24 +109,6 @@ elif page == "Activity Log":
         st.dataframe(rows, use_container_width=True)
     else:
         st.info("No activity yet.")
-    
-elif page == "Email Log":
-    st.header("Email Log — Past Campaigns")
-    campaigns = db.get_campaign_log()
-    if not campaigns:
-        st.info("No campaigns sent yet.")
-    else:
-        for c in campaigns:
-            label = (f"{c.sent_at:%Y-%m-%d %H:%M} · {c.retailer_type} · "
-                     f"\"{c.subject}\" · {c.sent_ok}/{c.total} sent"
-                     + (f" · {c.failed} failed" if c.failed else ""))
-            with st.expander(label):
-                st.caption(f"Sent by {c.sent_by}")
-                detail = db.get_batch_detail(c.batch_id)
-                st.dataframe(
-                    [(d.sent_at, d.recipient, d.status, d.error) for d in detail],
-                    use_container_width=True,
-                )
 
 # ---------- Admin ----------
 elif page == "Admin":
