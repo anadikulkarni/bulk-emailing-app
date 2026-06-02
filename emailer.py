@@ -4,6 +4,7 @@ import smtplib
 from email.message import EmailMessage
 from dotenv import load_dotenv
 from pathlib import Path
+import streamlit as st
 
 # load_dotenv(Path(__file__).parent / ".env", override=True)
 
@@ -15,6 +16,9 @@ from pathlib import Path
 
 # print("GMAIL_ADDRESS:", os.environ.get("GMAIL_ADDRESS", "NOT FOUND"))
 # print("GMAIL_APP_PASSWORD:", os.environ.get("GMAIL_APP_PASSWORD", "NOT FOUND"))
+
+for key, value in st.secrets.items():
+    os.environ[key] = str(value)
 
 def _build_message(to_addr, subject, body, attachment_name=None, attachment_bytes=None):
     msg = EmailMessage()

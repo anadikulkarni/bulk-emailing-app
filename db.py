@@ -1,5 +1,6 @@
 import os
 import pymssql
+import streamlit as st
 
 for key, value in st.secrets.items():
     os.environ[key] = str(value)
