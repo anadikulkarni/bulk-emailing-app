@@ -99,12 +99,17 @@ if page == "Compose & Send":
 # ---------- Activity Log ----------
 elif page == "Activity Log":
     st.header("Activity Log")
-    with db.get_conn() as c:
-        rows = c.execute(
-            "SELECT TOP 500 sent_at, sent_by, retailer_type, recipient, subject, status, error "
-            "FROM EMAIL_LOG ORDER BY sent_at DESC"
-        ).fetchall()
-    st.dataframe([tuple(r) for r in rows], use_container_width=True)
+    conn = db.get_conn()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute(
+        "SELECT TOP 500 sent_at, sent_by, retailer_type, recipient, subject, status, error "
+        "FROM EMAIL_LOG ORDER BY sent_at DESC"
+    )
+    rows = cursor.fetchall()
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.info("No activity yet.")
     
 elif page == "Email Log":
     st.header("Email Log — Past Campaigns")

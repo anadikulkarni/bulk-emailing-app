@@ -4,6 +4,7 @@ import pymssql
 def get_conn():
     return pymssql.connect(
         server=os.environ["DB_SERVER"],
+        port=os.environ["DB_PORT"]
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
         database=os.environ["DB_NAME"],
