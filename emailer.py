@@ -3,8 +3,18 @@ import time
 import smtplib
 from email.message import EmailMessage
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+# load_dotenv(Path(__file__).parent / ".env", override=True)
+
+# env_path = Path(__file__).parent / ".env"
+# print("Looking for .env at:", env_path)
+# print("File exists:", env_path.exists())
+
+# # load_dotenv()
+
+# print("GMAIL_ADDRESS:", os.environ.get("GMAIL_ADDRESS", "NOT FOUND"))
+# print("GMAIL_APP_PASSWORD:", os.environ.get("GMAIL_APP_PASSWORD", "NOT FOUND"))
 
 def _build_message(to_addr, subject, body, attachment_name=None, attachment_bytes=None):
     msg = EmailMessage()
@@ -23,10 +33,12 @@ def _build_message(to_addr, subject, body, attachment_name=None, attachment_byte
 
 def send_bulk(recipients, subject, body, attachment_name=None, attachment_bytes=None,
               progress_cb=None):
-    """Returns list of (recipient, status, error)."""
     results = []
     delay = float(os.environ.get("SEND_DELAY_SECONDS", "1"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
         server.login(os.environ["GMAIL_ADDRESS"], os.environ["GMAIL_APP_PASSWORD"])
         for i, addr in enumerate(recipients):
             try:

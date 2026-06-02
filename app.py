@@ -1,8 +1,13 @@
 import streamlit as st
 import auth
 import db
+import os
 from emailer import send_bulk
 import pyodbc
+
+# Push Streamlit secrets into os.environ so all modules pick them up
+for key, value in st.secrets.items():
+    os.environ[key] = str(value)
 
 st.set_page_config(page_title="Bulk Email Sender", page_icon="📧")
 
@@ -29,8 +34,32 @@ st.sidebar.write(f"Signed in as **{user['username']}** ({user['role']})")
 if st.sidebar.button("Log out"):
     del st.session_state.user
     st.rerun()
+    
+# ---------- Sidebar: test email ----------
+with st.sidebar.expander("🧪 Send test email"):
+    default_to = os.environ.get("GMAIL_ADDRESS", "")
+    test_to = st.text_input("Send test to", value=default_to, key="test_to")
+    if st.button("Send test", key="send_test"):
+        if not test_to or "@" not in test_to:
+            st.warning("Enter a valid email address.")
+        else:
+            results = send_bulk(
+                [test_to.strip()],
+                subject="Test email — Bulk Email Sender",
+                body=(
+                    "This is a test message from the Bulk Email Sender app.\n\n"
+                    f"Sent by: {user['username']}\n"
+                    "If you received this, the Workspace SMTP path is working."
+                ),
+            )
+            addr, status, err = results[0]
+            db.log_email(None, "TEST", addr, "Test email", status, err, user["username"])
+            if status == "SENT":
+                st.success(f"Test sent to {addr}.")
+            else:
+                st.error(f"Failed: {err}")
 
-pages = ["Compose & Send", "Scheduled Jobs", "Activity Log"]
+pages = ["Compose & Send", "Email Log", "Activity Log"]
 if user["role"] == "admin":
     pages.append("Admin")
 page = st.sidebar.radio("Navigate", pages)
@@ -50,57 +79,22 @@ if page == "Compose & Send":
     att_name = up.name if up else None
     att_bytes = up.getvalue() if up else None
 
-    mode = st.radio("When", ["Send now", "Schedule for later"], horizontal=True)
-
-    if mode == "Schedule for later":
-        import datetime
-        col1, col2 = st.columns(2)
-        d = col1.date_input("Date", datetime.date.today())
-        t = col2.time_input("Time", datetime.time(9, 0))
-        send_at = datetime.datetime.combine(d, t)
-        if st.button("Schedule", type="primary", disabled=not (recipients and subject and body)):
-            with db.get_conn() as c:
-                c.execute(
-                    "INSERT INTO SCHEDULED_EMAILS "
-                    "(retailer_type, subject, body, attachment_name, attachment_data, send_at, created_by) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    rtype, subject, body, att_name,
-                    pyodbc_bytes(att_bytes), send_at, user["username"],
-                )
-            st.success(f"Scheduled for {send_at}. The worker will pick it up.")
-    else:
-        if st.button("Send now", type="primary", disabled=not (recipients and subject and body)):
+    if st.button("Send now", type="primary", disabled=not (recipients and subject and body)):
+            import uuid
+            batch_id = str(uuid.uuid4())
             bar = st.progress(0, text="Sending…")
             results = send_bulk(
                 recipients, subject, body, att_name, att_bytes,
                 progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
             )
             for addr, status, err in results:
-                db.log_email(None, rtype, addr, subject, status, err, user["username"])
+                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
             sent = sum(1 for _, s, _ in results if s == "SENT")
             st.success(f"Done. {sent}/{len(results)} sent.")
             failed = [(a, e) for a, s, e in results if s == "FAILED"]
             if failed:
                 st.error("Failures:")
                 st.table(failed)
-
-# ---------- Scheduled Jobs ----------
-elif page == "Scheduled Jobs":
-    st.header("Scheduled Jobs")
-    with db.get_conn() as c:
-        rows = c.execute(
-            "SELECT id, retailer_type, subject, send_at, status, created_by, processed_at "
-            "FROM SCHEDULED_EMAILS ORDER BY send_at DESC"
-        ).fetchall()
-    st.dataframe([tuple(r) for r in rows],
-                 column_config=None, use_container_width=True)
-    cancel_id = st.number_input("Cancel a PENDING job by ID", min_value=0, step=1)
-    if st.button("Cancel job") and cancel_id:
-        with db.get_conn() as c:
-            c.execute("UPDATE SCHEDULED_EMAILS SET status='FAILED', "
-                      "result_summary='Cancelled by user' "
-                      "WHERE id=? AND status='PENDING'", cancel_id)
-        st.rerun()
 
 # ---------- Activity Log ----------
 elif page == "Activity Log":
@@ -111,6 +105,24 @@ elif page == "Activity Log":
             "FROM EMAIL_LOG ORDER BY sent_at DESC"
         ).fetchall()
     st.dataframe([tuple(r) for r in rows], use_container_width=True)
+    
+elif page == "Email Log":
+    st.header("Email Log — Past Campaigns")
+    campaigns = db.get_campaign_log()
+    if not campaigns:
+        st.info("No campaigns sent yet.")
+    else:
+        for c in campaigns:
+            label = (f"{c.sent_at:%Y-%m-%d %H:%M} · {c.retailer_type} · "
+                     f"\"{c.subject}\" · {c.sent_ok}/{c.total} sent"
+                     + (f" · {c.failed} failed" if c.failed else ""))
+            with st.expander(label):
+                st.caption(f"Sent by {c.sent_by}")
+                detail = db.get_batch_detail(c.batch_id)
+                st.dataframe(
+                    [(d.sent_at, d.recipient, d.status, d.error) for d in detail],
+                    use_container_width=True,
+                )
 
 # ---------- Admin ----------
 elif page == "Admin":
