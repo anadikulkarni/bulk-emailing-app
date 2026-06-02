@@ -1,6 +1,9 @@
 import os
 import pymssql
 
+for key, value in st.secrets.items():
+    os.environ[key] = str(value)
+
 def get_conn():
     return pymssql.connect(
         server=os.environ["DB_SERVER"],
