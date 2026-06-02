@@ -2,8 +2,6 @@ import os
 import time
 import smtplib
 from email.message import EmailMessage
-from dotenv import load_dotenv
-from pathlib import Path
 import streamlit as st
 
 # load_dotenv(Path(__file__).parent / ".env", override=True)
