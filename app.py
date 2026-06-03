@@ -2,28 +2,40 @@ import streamlit as st
 import auth
 import db
 import os
-from emailer import send_bulk
 import json
+import uuid
+import time
+from emailer import send_bulk
 
-# Push Streamlit secrets into os.environ so all modules pick them up
+# Push Streamlit secrets into os.environ
 for key, value in st.secrets.items():
     os.environ[key] = str(value)
 
 st.set_page_config(page_title="Bulk Email Sender", page_icon="📧")
 
+DAILY_CAP = 1800
+
 # ---------- Session / login ----------
 def login_screen():
     st.title("📧 Bulk Email Sender — Login")
+    if "failed_attempts" not in st.session_state:
+        st.session_state.failed_attempts = 0
     with st.form("login"):
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
         if st.form_submit_button("Log in"):
             user = auth.verify_user(u, p)
             if user:
+                st.session_state.failed_attempts = 0
                 st.session_state.user = user
                 st.rerun()
             else:
-                st.error("Invalid credentials or inactive account.")
+                st.session_state.failed_attempts += 1
+                if st.session_state.failed_attempts >= 5:
+                    st.error("Too many failed attempts. Please wait.")
+                    time.sleep(5)
+                else:
+                    st.error("Invalid credentials or inactive account.")
 
 if "user" not in st.session_state:
     login_screen()
@@ -34,7 +46,7 @@ st.sidebar.write(f"Signed in as **{user['username']}** ({user['role']})")
 if st.sidebar.button("Log out"):
     del st.session_state.user
     st.rerun()
-    
+
 # ---------- Sidebar: test email ----------
 with st.sidebar.expander("🧪 Send test email"):
     default_to = os.environ.get("GMAIL_ADDRESS", "")
@@ -64,11 +76,17 @@ if user["role"] == "admin":
     pages.append("Admin")
 page = st.sidebar.radio("Navigate", pages)
 
-DAILY_CAP = 1800  # safely under Workspace's 2000/day limit
-
 # ---------- Compose & Send ----------
 if page == "Compose & Send":
     st.header("Compose & Send")
+
+    # initialise session state flags
+    if "confirm_send" not in st.session_state:
+        st.session_state.confirm_send = False
+    if "sending" not in st.session_state:
+        st.session_state.sending = False
+    if "staged" not in st.session_state:
+        st.session_state.staged = None  # holds everything needed to actually send
 
     recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
 
@@ -102,75 +120,104 @@ if page == "Compose & Send":
     att_bytes = up.getvalue() if up else None
 
     over_cap = len(recipients) > DAILY_CAP
+    can_send = bool(recipients and subject and body)
 
     if over_cap:
-        first_batch = recipients[:DAILY_CAP]
-        remainder = recipients[DAILY_CAP:]
         st.warning(
-            f"⚠️ {len(recipients)} recipients exceeds the daily send cap of {DAILY_CAP}. "
-            f"The first **{len(first_batch)}** will be sent now and the remaining "
-            f"**{len(remainder)}** will be saved to **Pending Sends** for tomorrow."
+            f"⚠️ {len(recipients)} recipients exceeds the daily cap of {DAILY_CAP}. "
+            f"The first **{DAILY_CAP}** will be sent now and the remaining "
+            f"**{len(recipients) - DAILY_CAP}** will be saved to Pending Sends."
         )
-        if st.button("Send first 1,800 now & save remainder", type="primary",
-                     disabled=not (recipients and subject and body)):
-            import uuid
 
-            # --- Send first batch ---
-            batch_id = str(uuid.uuid4())
-            bar = st.progress(0, text="Sending…")
-            results = send_bulk(
-                first_batch, subject, body, att_name, att_bytes,
-                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
-            )
-            for addr, status, err in results:
-                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
-            sent = sum(1 for _, s, _ in results if s == "SENT")
-            st.success(f"First batch done. {sent}/{len(first_batch)} sent.")
-            failed = [(a, e) for a, s, e in results if s == "FAILED"]
-            if failed:
-                st.error("Failures in first batch:")
-                st.table(failed)
+    # --- Step 1: user clicks Send / Send first 1800 ---
+    btn_label = f"Send first {DAILY_CAP} now & save remainder" if over_cap else "Send now"
+    if not st.session_state.confirm_send and not st.session_state.sending:
+        if st.button(btn_label, type="primary", disabled=not can_send):
+            # snapshot everything into staged so confirmation uses same data
+            st.session_state.staged = {
+                "rtype": rtype,
+                "recipients": recipients,
+                "subject": subject,
+                "body": body,
+                "att_name": att_name,
+                "att_bytes": att_bytes,
+                "over_cap": over_cap,
+            }
+            st.session_state.confirm_send = True
+            st.rerun()
 
-            # --- Save remainder ---
+    # --- Step 2: confirmation gate ---
+    if st.session_state.confirm_send and st.session_state.staged:
+        s = st.session_state.staged
+        send_count = min(len(s["recipients"]), DAILY_CAP)
+        st.warning(
+            f"About to send **{send_count}** emails "
+            f"({'+ save remainder' if s['over_cap'] else ''}). "
+            "This cannot be undone."
+        )
+        col1, col2 = st.columns(2)
+        if col1.button("✅ Yes, send", type="primary"):
+            st.session_state.confirm_send = False
+            st.session_state.sending = True
+            st.rerun()
+        if col2.button("❌ Cancel"):
+            st.session_state.confirm_send = False
+            st.session_state.staged = None
+            st.rerun()
+
+    # --- Step 3: actual send ---
+    if st.session_state.sending and st.session_state.staged:
+        s = st.session_state.staged
+        first_batch = s["recipients"][:DAILY_CAP]
+        remainder = s["recipients"][DAILY_CAP:]
+
+        batch_id = str(uuid.uuid4())
+        bar = st.progress(0, text="Sending…")
+        results = send_bulk(
+            first_batch, s["subject"], s["body"], s["att_name"], s["att_bytes"],
+            progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+        )
+        for addr, status, err in results:
+            db.log_email(None, s["rtype"], addr, s["subject"],
+                         status, err, user["username"], batch_id)
+
+        sent = sum(1 for _, st_, _ in results if st_ == "SENT")
+        st.success(f"Done. {sent}/{len(first_batch)} sent.")
+        failed = [(a, e) for a, st_, e in results if st_ == "FAILED"]
+        if failed:
+            st.error("Failures:")
+            st.table(failed)
+
+        if remainder:
             db.save_remainder(
-                label=f"{rtype} — remainder ({len(remainder)} recipients)",
-                retailer_type=rtype,
-                subject=subject,
-                body=body,
-                attachment_name=att_name,
-                attachment_bytes=att_bytes,
+                label=f"{s['rtype']} — remainder ({len(remainder)} recipients)",
+                retailer_type=s["rtype"],
+                subject=s["subject"],
+                body=s["body"],
+                attachment_name=s["att_name"],
+                attachment_bytes=s["att_bytes"],
                 recipients=remainder,
                 created_by=user["username"],
             )
             st.info(f"✅ {len(remainder)} remaining recipients saved to Pending Sends.")
-    else:
-        if st.button("Send now", type="primary",
-                     disabled=not (recipients and subject and body)):
-            import uuid
-            batch_id = str(uuid.uuid4())
-            bar = st.progress(0, text="Sending…")
-            results = send_bulk(
-                recipients, subject, body, att_name, att_bytes,
-                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
-            )
-            for addr, status, err in results:
-                db.log_email(None, rtype, addr, subject, status, err, user["username"], batch_id)
-            sent = sum(1 for _, s, _ in results if s == "SENT")
-            st.success(f"Done. {sent}/{len(results)} sent.")
-            failed = [(a, e) for a, s, e in results if s == "FAILED"]
-            if failed:
-                st.error("Failures:")
-                st.table(failed)
+
+        st.session_state.sending = False
+        st.session_state.staged = None
 
 # ---------- Pending Sends ----------
 elif page == "Pending Sends":
     st.header("Pending Sends")
+
+    if "confirm_remainder" not in st.session_state:
+        st.session_state.confirm_remainder = None  # stores remainder id to confirm
+
     remainders = db.get_pending_remainders()
     if not remainders:
         st.info("No pending sends. You're all caught up.")
     else:
         for r in remainders:
             recipients = json.loads(r["recipients"])
+            over_cap = len(recipients) > DAILY_CAP
             with st.expander(f"📬 {r['label']} — saved {r['created_at']:%Y-%m-%d %H:%M}"):
                 st.write(f"**Subject:** {r['subject']}")
                 st.write(f"**Recipients:** {len(recipients)}")
@@ -178,68 +225,82 @@ elif page == "Pending Sends":
                 with st.expander("Preview recipients"):
                     st.write(recipients)
 
-                over_cap = len(recipients) > DAILY_CAP
                 if over_cap:
                     st.warning(
-                        f"This batch still has {len(recipients)} recipients — over the {DAILY_CAP} cap. "
-                        f"Sending first {DAILY_CAP} and re-saving the rest."
+                        f"Still {len(recipients)} recipients — over cap. "
+                        f"Will send first {DAILY_CAP} and re-save the rest."
                     )
 
                 btn_label = (f"Send first {DAILY_CAP} & save remainder"
                              if over_cap else f"Send all {len(recipients)} now")
 
-                if st.button(btn_label, key=f"send_rem_{r['id']}", type="primary"):
-                    import uuid
-                    send_now = recipients[:DAILY_CAP]
-                    leftover = recipients[DAILY_CAP:]
-
-                    batch_id = str(uuid.uuid4())
-                    bar = st.progress(0, text="Sending…")
-                    att_bytes = bytes(r["attachment_data"]) if r["attachment_data"] else None
-                    results = send_bulk(
-                        send_now, r["subject"], r["body"],
-                        r["attachment_name"], att_bytes,
-                        progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+                # confirmation gate per remainder
+                if st.session_state.confirm_remainder != r["id"]:
+                    if st.button(btn_label, key=f"send_rem_{r['id']}", type="primary"):
+                        st.session_state.confirm_remainder = r["id"]
+                        st.rerun()
+                else:
+                    send_count = min(len(recipients), DAILY_CAP)
+                    st.warning(
+                        f"About to send **{send_count}** emails. This cannot be undone."
                     )
-                    for addr, status, err in results:
-                        db.log_email(None, r["retailer_type"], addr, r["subject"],
-                                     status, err, user["username"], batch_id)
-                    sent = sum(1 for _, s, _ in results if s == "SENT")
-                    st.success(f"Done. {sent}/{len(send_now)} sent.")
-                    failed = [(a, e) for a, s, e in results if s == "FAILED"]
-                    if failed:
-                        st.error("Failures:")
-                        st.table(failed)
+                    col1, col2 = st.columns(2)
+                    if col1.button("✅ Yes, send", key=f"confirm_yes_{r['id']}", type="primary"):
+                        st.session_state.confirm_remainder = None
+                        send_now = recipients[:DAILY_CAP]
+                        leftover = recipients[DAILY_CAP:]
 
-                    # mark this one done
-                    db.mark_remainder_sent(r["id"])
-
-                    # if still more left, save again
-                    if leftover:
-                        db.save_remainder(
-                            label=f"{r['retailer_type']} — remainder ({len(leftover)} recipients)",
-                            retailer_type=r["retailer_type"],
-                            subject=r["subject"],
-                            body=r["body"],
-                            attachment_name=r["attachment_name"],
-                            attachment_bytes=att_bytes,
-                            recipients=leftover,
-                            created_by=user["username"],
+                        batch_id = str(uuid.uuid4())
+                        bar = st.progress(0, text="Sending…")
+                        att_bytes = bytes(r["attachment_data"]) if r["attachment_data"] else None
+                        results = send_bulk(
+                            send_now, r["subject"], r["body"],
+                            r["attachment_name"], att_bytes,
+                            progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
                         )
-                        st.info(f"{len(leftover)} still remaining — saved back to Pending Sends.")
+                        for addr, status, err in results:
+                            db.log_email(None, r["retailer_type"], addr, r["subject"],
+                                         status, err, user["username"], batch_id)
+                        sent = sum(1 for _, s, _ in results if s == "SENT")
+                        st.success(f"Done. {sent}/{len(send_now)} sent.")
+                        failed = [(a, e) for a, s, e in results if s == "FAILED"]
+                        if failed:
+                            st.error("Failures:")
+                            st.table(failed)
 
-                    st.rerun()
+                        db.mark_remainder_sent(r["id"])
+
+                        if leftover:
+                            db.save_remainder(
+                                label=f"{r['retailer_type']} — remainder ({len(leftover)} recipients)",
+                                retailer_type=r["retailer_type"],
+                                subject=r["subject"],
+                                body=r["body"],
+                                attachment_name=r["attachment_name"],
+                                attachment_bytes=att_bytes,
+                                recipients=leftover,
+                                created_by=user["username"],
+                            )
+                            st.info(f"{len(leftover)} still remaining — saved back to Pending Sends.")
+                        st.rerun()
+
+                    if col2.button("❌ Cancel", key=f"confirm_no_{r['id']}"):
+                        st.session_state.confirm_remainder = None
+                        st.rerun()
 
 # ---------- Activity Log ----------
 elif page == "Activity Log":
     st.header("Activity Log")
     conn = db.get_conn()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute(
-        "SELECT TOP 500 sent_at, sent_by, retailer_type, recipient, subject, status, error "
-        "FROM EMAIL_LOG ORDER BY sent_at DESC"
-    )
-    rows = cursor.fetchall()
+    try:
+        cursor = conn.cursor(as_dict=True)
+        cursor.execute(
+            "SELECT TOP 500 sent_at, sent_by, retailer_type, recipient, subject, status, error "
+            "FROM EMAIL_LOG ORDER BY sent_at DESC"
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
     if rows:
         st.dataframe(rows, use_container_width=True)
     else:
@@ -250,8 +311,8 @@ elif page == "Admin":
     st.header("Admin — User Management")
     st.subheader("Add user")
     with st.form("adduser"):
-        nu = st.text_input("New username")
-        npw = st.text_input("Temp password", type="password")
+        nu = st.text_input("New username", key="new_username")
+        npw = st.text_input("Temp password", type="password", key="new_temp_pw")
         nrole = st.selectbox("Role", ["user", "admin"])
         if st.form_submit_button("Create"):
             try:
@@ -263,14 +324,18 @@ elif page == "Admin":
     st.subheader("Existing users")
     for u in auth.list_users():
         c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        c1.write(f"**{u.username}** — {u.role} — {'active' if u.is_active else 'disabled'}")
-        if c2.button("Toggle active", key=f"act{u.username}"):
-            auth.set_active(u.username, not u.is_active); st.rerun()
-        newpw = c3.text_input("Reset pw", key=f"pw{u.username}", type="password", label_visibility="collapsed")
-        if c3.button("Reset", key=f"rst{u.username}") and newpw:
-            auth.reset_password(u.username, newpw); st.success("Reset.")
-        if c4.button("Delete", key=f"del{u.username}"):
-            if u.username == user["username"]:
+        c1.write(f"**{u['username']}** — {u['role']} — {'active' if u['is_active'] else 'disabled'}")
+        if c2.button("Toggle active", key=f"act_{u['username']}"):
+            auth.set_active(u['username'], not u['is_active'])
+            st.rerun()
+        newpw = c3.text_input("Reset pw", key=f"pw_{u['username']}", type="password",
+                               label_visibility="collapsed")
+        if c3.button("Reset", key=f"rst_{u['username']}") and newpw:
+            auth.reset_password(u['username'], newpw)
+            st.success("Reset.")
+        if c4.button("Delete", key=f"del_{u['username']}"):
+            if u['username'] == user["username"]:
                 st.error("Can't delete yourself.")
             else:
-                auth.delete_user(u.username); st.rerun()
+                auth.delete_user(u['username'])
+                st.rerun()
