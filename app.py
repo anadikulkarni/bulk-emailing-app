@@ -90,16 +90,22 @@ if page == "Compose & Send":
         st.session_state.recipient_selections = {}
     if "last_rtype" not in st.session_state:
         st.session_state.last_rtype = None
+    if "recipient_page" not in st.session_state:
+        st.session_state.recipient_page = 0
+    if "last_search" not in st.session_state:
+        st.session_state.last_search = ""
 
     recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
 
     if recipient_mode == "Retailer Type":
         rtype = st.selectbox("Retailer Type", db.get_retailer_types())
 
-        # reset checkboxes when retailer type changes
+        # reset checkboxes and pagination when retailer type changes
         if rtype != st.session_state.last_rtype:
             st.session_state.last_rtype = rtype
             st.session_state.recipient_selections = {}
+            st.session_state.recipient_page = 0
+            st.session_state.last_search = ""
 
         all_recipients = db.get_emails_for_type(rtype) if rtype else []
 
@@ -109,12 +115,14 @@ if page == "Compose & Send":
                 st.session_state.recipient_selections[r["email"]] = True
 
         total = len(all_recipients)
-        selected_count = sum(1 for r in all_recipients
-                             if st.session_state.recipient_selections.get(r["email"], True))
+        selected_count = sum(
+            1 for r in all_recipients
+            if st.session_state.recipient_selections.get(r["email"], True)
+        )
         st.info(f"{selected_count} of {total} recipients selected.")
 
         with st.expander("Preview & select recipients"):
-            # select all / deselect all buttons
+            # select all / deselect all
             col_a, col_b, _ = st.columns([1, 1, 4])
             if col_a.button("Select all", key="sel_all"):
                 for r in all_recipients:
@@ -125,7 +133,7 @@ if page == "Compose & Send":
                     st.session_state.recipient_selections[r["email"]] = False
                 st.rerun()
 
-            # search filter so users can find specific names quickly
+            # search filter
             search = st.text_input("Search by name or email", key="recipient_search")
             filtered = [
                 r for r in all_recipients
@@ -133,8 +141,40 @@ if page == "Compose & Send":
                 or search.lower() in r["email"].lower()
             ] if search else all_recipients
 
-            # render checkboxes
-            for r in filtered:
+            # reset to page 0 when search changes
+            if search != st.session_state.last_search:
+                st.session_state.recipient_page = 0
+                st.session_state.last_search = search
+
+            # pagination
+            PAGE_SIZE = 100
+            total_pages = max(1, -(-len(filtered) // PAGE_SIZE))
+
+            # clamp page in case filtered results shrank
+            st.session_state.recipient_page = min(
+                st.session_state.recipient_page, total_pages - 1
+            )
+            page_idx = st.session_state.recipient_page
+            page_slice = filtered[page_idx * PAGE_SIZE: (page_idx + 1) * PAGE_SIZE]
+
+            # pagination controls
+            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+            if pcol1.button("← Prev", key="pg_prev", disabled=page_idx == 0):
+                st.session_state.recipient_page -= 1
+                st.rerun()
+            pcol2.markdown(
+                f"<div style='text-align:center; padding-top:6px'>"
+                f"Page {page_idx + 1} of {total_pages} "
+                f"({len(filtered)} result{'s' if len(filtered) != 1 else ''})"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            if pcol3.button("Next →", key="pg_next", disabled=page_idx >= total_pages - 1):
+                st.session_state.recipient_page += 1
+                st.rerun()
+
+            # render checkboxes for this page only
+            for r in page_slice:
                 checked = st.session_state.recipient_selections.get(r["email"], True)
                 label = f"{r['name']}  —  {r['email']}" if r["name"] else r["email"]
                 new_val = st.checkbox(label, value=checked, key=f"chk_{r['email']}")
@@ -181,6 +221,7 @@ if page == "Compose & Send":
         )
 
     btn_label = f"Send first {DAILY_CAP} now & save remainder" if over_cap else "Send now"
+
     if not st.session_state.confirm_send and not st.session_state.sending:
         if st.button(btn_label, type="primary", disabled=not can_send):
             st.session_state.staged = {
@@ -256,7 +297,7 @@ elif page == "Pending Sends":
     st.header("Pending Sends")
 
     if "confirm_remainder" not in st.session_state:
-        st.session_state.confirm_remainder = None  # stores remainder id to confirm
+        st.session_state.confirm_remainder = None
 
     remainders = db.get_pending_remainders()
     if not remainders:
@@ -278,10 +319,11 @@ elif page == "Pending Sends":
                         f"Will send first {DAILY_CAP} and re-save the rest."
                     )
 
-                btn_label = (f"Send first {DAILY_CAP} & save remainder"
-                             if over_cap else f"Send all {len(recipients)} now")
+                btn_label = (
+                    f"Send first {DAILY_CAP} & save remainder"
+                    if over_cap else f"Send all {len(recipients)} now"
+                )
 
-                # confirmation gate per remainder
                 if st.session_state.confirm_remainder != r["id"]:
                     if st.button(btn_label, key=f"send_rem_{r['id']}", type="primary"):
                         st.session_state.confirm_remainder = r["id"]
@@ -308,6 +350,7 @@ elif page == "Pending Sends":
                         for addr, status, err in results:
                             db.log_email(None, r["retailer_type"], addr, r["subject"],
                                          status, err, user["username"], batch_id)
+
                         sent = sum(1 for _, s, _ in results if s == "SENT")
                         st.success(f"Done. {sent}/{len(send_now)} sent.")
                         failed = [(a, e) for a, s, e in results if s == "FAILED"]
