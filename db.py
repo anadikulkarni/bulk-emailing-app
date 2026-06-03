@@ -35,18 +35,23 @@ def get_retailer_types():
 
 def get_emails_for_type(retailer_type):
     with get_conn_ctx() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(as_dict=True)
         cursor.execute(
-            "SELECT DISTINCT Email FROM RETAILER_MASTER "
+            "SELECT DISTINCT Customer_Name, Email FROM RETAILER_MASTER "
             "WHERE Retailer_Type = %s "
             "AND UPPER(LTRIM(RTRIM(Dead_Alive))) = 'Y' "
             "AND Email IS NOT NULL AND LTRIM(RTRIM(Email)) <> ''",
             (retailer_type,)
         )
-        return sorted({
-            r[0].strip() for r in cursor.fetchall()
-            if r[0] and "@" in r[0]
-        })
+        rows = cursor.fetchall()
+        # dedupe by email, keep name
+        seen = {}
+        for r in rows:
+            email = r["Email"].strip()
+            name = (r["Customer_Name"] or "").strip()
+            if email and "@" in email and email not in seen:
+                seen[email] = name
+        return [{"name": v, "email": k} for k, v in sorted(seen.items())]
 
 def log_email(job_id, retailer_type, recipient, subject, status,
               error, sent_by, batch_id=None):

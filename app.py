@@ -80,22 +80,73 @@ page = st.sidebar.radio("Navigate", pages)
 if page == "Compose & Send":
     st.header("Compose & Send")
 
-    # initialise session state flags
     if "confirm_send" not in st.session_state:
         st.session_state.confirm_send = False
     if "sending" not in st.session_state:
         st.session_state.sending = False
     if "staged" not in st.session_state:
-        st.session_state.staged = None  # holds everything needed to actually send
+        st.session_state.staged = None
+    if "recipient_selections" not in st.session_state:
+        st.session_state.recipient_selections = {}
+    if "last_rtype" not in st.session_state:
+        st.session_state.last_rtype = None
 
     recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
 
     if recipient_mode == "Retailer Type":
         rtype = st.selectbox("Retailer Type", db.get_retailer_types())
-        recipients = db.get_emails_for_type(rtype) if rtype else []
-        st.info(f"{len(recipients)} email address(es) found for **{rtype}**.")
-        with st.expander("Preview recipients"):
-            st.write(recipients)
+
+        # reset checkboxes when retailer type changes
+        if rtype != st.session_state.last_rtype:
+            st.session_state.last_rtype = rtype
+            st.session_state.recipient_selections = {}
+
+        all_recipients = db.get_emails_for_type(rtype) if rtype else []
+
+        # initialise selections for any new entries (default all checked)
+        for r in all_recipients:
+            if r["email"] not in st.session_state.recipient_selections:
+                st.session_state.recipient_selections[r["email"]] = True
+
+        total = len(all_recipients)
+        selected_count = sum(1 for r in all_recipients
+                             if st.session_state.recipient_selections.get(r["email"], True))
+        st.info(f"{selected_count} of {total} recipients selected.")
+
+        with st.expander("Preview & select recipients"):
+            # select all / deselect all buttons
+            col_a, col_b, _ = st.columns([1, 1, 4])
+            if col_a.button("Select all", key="sel_all"):
+                for r in all_recipients:
+                    st.session_state.recipient_selections[r["email"]] = True
+                st.rerun()
+            if col_b.button("Deselect all", key="desel_all"):
+                for r in all_recipients:
+                    st.session_state.recipient_selections[r["email"]] = False
+                st.rerun()
+
+            # search filter so users can find specific names quickly
+            search = st.text_input("Search by name or email", key="recipient_search")
+            filtered = [
+                r for r in all_recipients
+                if search.lower() in r["name"].lower()
+                or search.lower() in r["email"].lower()
+            ] if search else all_recipients
+
+            # render checkboxes
+            for r in filtered:
+                checked = st.session_state.recipient_selections.get(r["email"], True)
+                label = f"{r['name']}  —  {r['email']}" if r["name"] else r["email"]
+                new_val = st.checkbox(label, value=checked, key=f"chk_{r['email']}")
+                if new_val != checked:
+                    st.session_state.recipient_selections[r["email"]] = new_val
+
+        # final recipient list = only checked emails
+        recipients = [
+            r["email"] for r in all_recipients
+            if st.session_state.recipient_selections.get(r["email"], True)
+        ]
+
     else:
         rtype = "CUSTOM"
         raw = st.text_area(
@@ -129,11 +180,9 @@ if page == "Compose & Send":
             f"**{len(recipients) - DAILY_CAP}** will be saved to Pending Sends."
         )
 
-    # --- Step 1: user clicks Send / Send first 1800 ---
     btn_label = f"Send first {DAILY_CAP} now & save remainder" if over_cap else "Send now"
     if not st.session_state.confirm_send and not st.session_state.sending:
         if st.button(btn_label, type="primary", disabled=not can_send):
-            # snapshot everything into staged so confirmation uses same data
             st.session_state.staged = {
                 "rtype": rtype,
                 "recipients": recipients,
@@ -146,7 +195,6 @@ if page == "Compose & Send":
             st.session_state.confirm_send = True
             st.rerun()
 
-    # --- Step 2: confirmation gate ---
     if st.session_state.confirm_send and st.session_state.staged:
         s = st.session_state.staged
         send_count = min(len(s["recipients"]), DAILY_CAP)
@@ -165,7 +213,6 @@ if page == "Compose & Send":
             st.session_state.staged = None
             st.rerun()
 
-    # --- Step 3: actual send ---
     if st.session_state.sending and st.session_state.staged:
         s = st.session_state.staged
         first_batch = s["recipients"][:DAILY_CAP]
