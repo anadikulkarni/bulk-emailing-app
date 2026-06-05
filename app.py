@@ -65,7 +65,12 @@ with st.sidebar.expander("🧪 Send test email"):
                 ),
             )
             addr, status, err = results[0]
-            db.log_email(None, "TEST", addr, "Test email", status, err, user["username"])
+            try:
+                db.log_emails_bulk(
+                    [(None, "TEST", addr, "Test email", status, err, user["username"], None)]
+                )
+            except Exception:
+                pass
             if status == "SENT":
                 st.success(f"Test sent to {addr}.")
             else:
@@ -265,9 +270,16 @@ if page == "Compose & Send":
             first_batch, s["subject"], s["body"], s["att_name"], s["att_bytes"],
             progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
         )
-        for addr, status, err in results:
-            db.log_email(None, s["rtype"], addr, s["subject"],
-                         status, err, user["username"], batch_id)
+
+        # --- bulk log: one DB connection for the whole batch ---
+        records = [
+            (None, s["rtype"], addr, s["subject"], status, err, user["username"], batch_id)
+            for addr, status, err in results
+        ]
+        try:
+            db.log_emails_bulk(records)
+        except Exception as e:
+            st.warning(f"Emails were sent, but writing to the activity log failed: {e}")
 
         sent = sum(1 for _, st_, _ in results if st_ == "SENT")
         st.success(f"Done. {sent}/{len(first_batch)} sent.")
@@ -347,9 +359,17 @@ elif page == "Pending Sends":
                             r["attachment_name"], att_bytes,
                             progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
                         )
-                        for addr, status, err in results:
-                            db.log_email(None, r["retailer_type"], addr, r["subject"],
-                                         status, err, user["username"], batch_id)
+
+                        # --- bulk log ---
+                        records = [
+                            (None, r["retailer_type"], addr, r["subject"],
+                             status, err, user["username"], batch_id)
+                            for addr, status, err in results
+                        ]
+                        try:
+                            db.log_emails_bulk(records)
+                        except Exception as e:
+                            st.warning(f"Emails were sent, but writing to the activity log failed: {e}")
 
                         sent = sum(1 for _, s, _ in results if s == "SENT")
                         st.success(f"Done. {sent}/{len(send_now)} sent.")
@@ -392,7 +412,7 @@ elif page == "Activity Log":
     finally:
         conn.close()
     if rows:
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, width='stretch')
     else:
         st.info("No activity yet.")
 

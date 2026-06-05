@@ -122,3 +122,17 @@ def mark_remainder_sent(remainder_id):
             "WHERE id=%s", (remainder_id,)
         )
         conn.commit()
+        
+def log_emails_bulk(records):
+    """records: list of 8-tuples matching the EMAIL_LOG columns."""
+    if not records:
+        return
+    with get_conn_ctx() as conn:
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT INTO EMAIL_LOG "
+            "(job_id, retailer_type, recipient, subject, status, error, sent_by, batch_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            records,
+        )
+        conn.commit()
