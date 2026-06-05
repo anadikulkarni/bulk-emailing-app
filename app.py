@@ -260,49 +260,59 @@ if page == "Compose & Send":
             st.rerun()
 
     if st.session_state.sending and st.session_state.staged:
-        s = st.session_state.staged
-        first_batch = s["recipients"][:DAILY_CAP]
-        remainder = s["recipients"][DAILY_CAP:]
-
-        batch_id = str(uuid.uuid4())
-        bar = st.progress(0, text="Sending…")
-        results = send_bulk(
-            first_batch, s["subject"], s["body"], s["att_name"], s["att_bytes"],
-            progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
-        )
-
-        # --- bulk log: one DB connection for the whole batch ---
-        records = [
-            (None, s["rtype"], addr, s["subject"], status, err, user["username"], batch_id)
-            for addr, status, err in results
-        ]
-        try:
-            db.log_emails_bulk(records)
-        except Exception as e:
-            st.warning(f"Emails were sent, but writing to the activity log failed: {e}")
-
-        sent = sum(1 for _, st_, _ in results if st_ == "SENT")
-        st.success(f"Done. {sent}/{len(first_batch)} sent.")
-        failed = [(a, e) for a, st_, e in results if st_ == "FAILED"]
-        if failed:
-            st.error("Failures:")
-            st.table(failed)
-
-        if remainder:
-            db.save_remainder(
-                label=f"{s['rtype']} — remainder ({len(remainder)} recipients)",
-                retailer_type=s["rtype"],
-                subject=s["subject"],
-                body=s["body"],
-                attachment_name=s["att_name"],
-                attachment_bytes=s["att_bytes"],
-                recipients=remainder,
-                created_by=user["username"],
+            st.warning(
+                "⚠️ **Sending in progress — please keep this tab open.** "
+                "Do not close, refresh, or navigate away from this page until you see "
+                "the 'Done' message, or the send may be interrupted."
             )
-            st.info(f"✅ {len(remainder)} remaining recipients saved to Pending Sends.")
+            s = st.session_state.staged
+            first_batch = s["recipients"][:DAILY_CAP]
+            remainder = s["recipients"][DAILY_CAP:]
 
-        st.session_state.sending = False
-        st.session_state.staged = None
+            # Save the remainder FIRST — before the long send — so an interruption
+            # mid-send can't lose it. The flag stops a rerun from double-saving.
+            if remainder and not s.get("remainder_saved"):
+                try:
+                    db.save_remainder(
+                        label=f"{s['rtype']} — remainder ({len(remainder)} recipients)",
+                        retailer_type=s["rtype"],
+                        subject=s["subject"],
+                        body=s["body"],
+                        attachment_name=s["att_name"],
+                        attachment_bytes=s["att_bytes"],
+                        recipients=remainder,
+                        created_by=user["username"],
+                    )
+                    s["remainder_saved"] = True
+                    st.info(f"✅ {len(remainder)} remaining recipients saved to Pending Sends.")
+                except Exception as e:
+                    st.error(f"Could not save remainder to Pending Sends: {e}")
+
+            batch_id = str(uuid.uuid4())
+            bar = st.progress(0, text="Sending…")
+            results = send_bulk(
+                first_batch, s["subject"], s["body"], s["att_name"], s["att_bytes"],
+                progress_cb=lambda i, n: bar.progress(i / n, text=f"Sent {i}/{n}"),
+            )
+
+            records = [
+                (None, s["rtype"], addr, s["subject"], status, err, user["username"], batch_id)
+                for addr, status, err in results
+            ]
+            try:
+                db.log_emails_bulk(records)
+            except Exception as e:
+                st.warning(f"Emails were sent, but writing to the activity log failed: {e}")
+
+            sent = sum(1 for _, st_, _ in results if st_ == "SENT")
+            st.success(f"Done. {sent}/{len(first_batch)} sent.")
+            failed = [(a, e) for a, st_, e in results if st_ == "FAILED"]
+            if failed:
+                st.error("Failures:")
+                st.table(failed)
+
+            st.session_state.sending = False
+            st.session_state.staged = None
 
 # ---------- Pending Sends ----------
 elif page == "Pending Sends":
