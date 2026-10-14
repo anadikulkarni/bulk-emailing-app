@@ -274,6 +274,31 @@ def suggest_domain_fix(email):
     return f"{local}@{fixed}" if fixed else None
 
 
+def suggest_cell_fix(value):
+    """A corrected address for an invalid cell that is one address broken by
+    stray spaces ("dsrana151@gmail. com", "name @ gmail.com"), else None.
+
+    Spaces next to "@" or "." and inside the domain are never part of an
+    address, so they are simply dropped. Spaces inside the name part are only
+    dropped for Gmail, which ignores dots and allows no underscores — so
+    "first last@gmail.com" can only mean firstlast@gmail.com. Elsewhere it
+    could be first.last or first_last, so no guess is made. A misspelt
+    domain in the result is corrected too.
+    """
+    text = " ".join((value or "").split()).strip(_TOKEN_STRIP).rstrip(".")
+    if text.count("@") != 1 or " " not in text:
+        return None
+    local, _, domain = re.sub(r"\s*([@.])\s*", r"\1", text).partition("@")
+    domain = domain.replace(" ", "").lower()
+    domain = _fix_domain(domain) or domain
+    if " " in local:
+        if domain not in ("gmail.com", "googlemail.com"):
+            return None
+        local = local.replace(" ", "")
+    fixed = f"{local}@{domain}"
+    return fixed if is_valid_email(fixed) else None
+
+
 def detect_email_columns(df, sample=2000):
     """Columns that look like they hold email addresses, best first.
 
@@ -356,8 +381,11 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
       addresses      valid addresses found, duplicates included
       duplicates     addresses dropped because they were already in the list
       problems       [{row, name, value, issue}] rows that are blank or invalid
+      fixable        [{key, email, fixed_from, name, detail, rows}] corrected
+                     addresses for invalid cells that are only broken by
+                     stray spaces (see suggest_cell_fix), not yet in recipients
     """
-    found = {}
+    found, fixable, fixed_rows = {}, {}, []
     rows_valid = rows_blank = rows_invalid = addresses = 0
     problems = []
     names = df[name_col].tolist() if name_col else [""] * len(df)
@@ -375,13 +403,24 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
             v, bad = parse_email_cell(cell)
             valid += v
             invalid += bad
+        detail = " / ".join(col[i] for col in detail_values if col[i])
+        fixes = {cell: suggest_cell_fix(cell) for cell in invalid}
+        for cell, fix in fixes.items():
+            if fix:
+                entry = fixable.setdefault(fix.lower(), {
+                    "key": fix.lower(), "email": fix, "fixed_from": cell,
+                    "name": names[i], "detail": detail, "rows": 0})
+                entry["rows"] += 1
         if invalid:
+            problem = {"row": row_no, "name": names[i], "value": " | ".join(invalid),
+                       "issue": "invalid email" + (" in one column" if valid else "")}
+            problems.append(problem)
+            if all(fixes.values()):
+                fixed_rows.append((problem, [f.lower() for f in fixes.values()]))
+        if not valid:
             rows_invalid += 1
-            problems.append({"row": row_no, "name": names[i], "value": " | ".join(cells),
-                             "issue": "invalid email"})
             continue
         rows_valid += 1
-        detail = " / ".join(col[i] for col in detail_values if col[i])
         for email in valid:
             addresses += 1
             key = email.lower()
@@ -390,6 +429,9 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
             else:
                 found[key] = {"key": key, "email": email, "name": names[i],
                               "detail": detail, "rows": 1}
+    for problem, keys in fixed_rows:
+        problem["issue"] += (" (the corrected address is already in the list)"
+                             if all(k in found for k in keys) else " (fix suggested below)")
     return {
         "recipients": list(found.values()),
         "rows": len(df),
@@ -399,6 +441,7 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
         "addresses": addresses,
         "duplicates": addresses - len(found),
         "problems": problems,
+        "fixable": [f for k, f in fixable.items() if k not in found],
     }
 
 

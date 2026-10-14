@@ -284,9 +284,13 @@ if page == "Compose & Send":
                 recipients.append(e)
 
         if rejected:
+            shown = [
+                f"{r} (did you mean {fix}?)" if (fix := dataset.suggest_cell_fix(r)) else r
+                for r in rejected[:10]
+            ]
             st.warning(
                 f"Skipped {len(rejected)} typed entr{'y' if len(rejected) == 1 else 'ies'} "
-                f"that aren't valid email addresses: {', '.join(rejected[:10])}"
+                f"that aren't valid email addresses: {', '.join(shown)}"
                 + (" …" if len(rejected) > 10 else "")
             )
         if list_file and typed:
