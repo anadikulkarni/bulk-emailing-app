@@ -198,13 +198,14 @@ def _problem_rows(problems, title, hint):
         st.caption(hint)
 
 
-def _typo_fixes(full, result, t):
-    """Flag addresses whose domain looks misspelt (gmai.com …) and, if the user
-    opts in, swap in the corrected address. Returns the recipient list to use.
+def _corrections(full, result, t):
+    """Offer corrections for addresses that are probably typos — a misspelt
+    domain (gmai.com) or stray spaces (gmail. com) — and, if the user opts in,
+    use the corrected addresses. Returns the recipient list to use.
 
     Suggestions come from the whole file, so the opt-in stays on screen (and
-    on) while filters change. Corrected recipients keep their original key, so
-    anyone already unticked stays unticked.
+    on) while filters change. Corrected recipients keep a stable key, so anyone
+    already unticked stays unticked.
     """
     fixes = {}
     for r in full["recipients"]:
@@ -212,24 +213,27 @@ def _typo_fixes(full, result, t):
         if fix:
             fixes[r["key"]] = fix
     recipients = result["recipients"]
-    if not fixes:
+    if not fixes and not full["fixable"]:
         return recipients
-    in_view = [r for r in recipients if r["key"] in fixes]
-    n = len(in_view)
-    title = (f"🔤 {n} address{'es look' if n != 1 else ' looks'} like a misspelt email "
-             "domain (e.g. gmai.com) and will probably bounce" if in_view
-             else "🔤 Misspelt email domains: none in the filtered rows")
+    rows = [{"Name": r["name"], "In file": r["fixed_from"], "Suggested": r["email"],
+             "Problem": r["problem"]} for r in result["fixable"]]
+    rows += [{"Name": r["name"], "In file": r["email"], "Suggested": fixes[r["key"]],
+              "Problem": ("text after .com" if r["email"].lower().startswith(fixes[r["key"]].lower())
+                          else "misspelt domain")}
+             for r in recipients if r["key"] in fixes]
+    n = len(rows)
+    title = (f"🔤 {n} address{'es' if n != 1 else ''} can probably be corrected — "
+             "misspelt domains, stray spaces, missing @ or .com …" if rows
+             else "🔤 Corrections: none needed in the filtered rows")
     with st.expander(title):
-        if in_view:
-            st.dataframe(
-                pd.DataFrame([{"Name": r["name"], "Address in file": r["email"],
-                               "Suggested": fixes[r["key"]]} for r in in_view]),
-                hide_index=True, width="stretch",
-            )
+        if rows:
+            st.dataframe(pd.DataFrame(rows)[["In file", "Suggested", "Problem", "Name"]],
+                         hide_index=True, width="stretch")
         use_fixes = st.checkbox("Send to the suggested addresses instead",
                                 key=keep(f"{t}_typo_fix"))
-        st.caption("Corrected addresses are marked ✏️ in the list below, where any of "
-                   "them can still be unticked.")
+        st.caption("Misspelt domains would bounce; invalid addresses aren't sent at all "
+                   "unless corrected. Corrected addresses are marked ✏️ in the list below, "
+                   "where any of them can still be unticked.")
     if not use_fixes:
         return recipients
     fixed, seen = [], {r["email"].lower() for r in recipients if r["key"] not in fixes}
@@ -240,6 +244,10 @@ def _typo_fixes(full, result, t):
             seen.add(fixes[r["key"]].lower())
             r = {**r, "email": fixes[r["key"]], "fixed_from": r["email"]}
         fixed.append(r)
+    for r in result["fixable"]:
+        if r["email"].lower() not in seen:
+            seen.add(r["email"].lower())
+            fixed.append(r)
     return fixed
 
 
@@ -303,6 +311,8 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None,
         f"address + {full['rows_invalid']:,} with an invalid one + {full['rows_blank']:,} "
         f"blank = {full['rows']:,} rows. {full['addresses']:,} addresses found, "
         f"{full['duplicates']:,} repeats merged → {len(full['recipients']):,} unique."
+        + (f" {len(full['fixable']):,} of the invalid ones can be corrected — see 🔤 below."
+           if full["fixable"] else "")
     )
 
     extra = [c for c in detected if c not in email_cols]
@@ -359,7 +369,7 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None,
         "missing or invalid email",
         problem_hint,
     )
-    recipients = _typo_fixes(full, result, t)
+    recipients = _corrections(full, result, t)
 
     return recipient_picker(recipients, ns, reset_token=(t, tuple(email_cols)))
 

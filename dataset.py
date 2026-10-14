@@ -249,18 +249,38 @@ def _edit_distance(a, b):
     return prev[-1]
 
 
+# Real top-level domains that start like "com…" / "net…" / "org…" junk.
+_TLDS_LIKE_JUNK = {"community", "company", "computer", "comcast", "commbank", "compare",
+                   "comsec", "network", "netflix", "netbank", "organic"}
+# Providers with no country domains: anything after their ".com" is a slip.
+_NO_COUNTRY_DOMAINS = {"gmail.com", "googlemail.com", "rediffmail.com"}
+_KNOWN_LONGEST_FIRST = sorted(_KNOWN_DOMAINS, key=len, reverse=True)
+
+
 @functools.lru_cache(maxsize=4096)
 def _fix_domain(domain):
     if domain in _KNOWN_DOMAINS:
         return None
+    # text typed straight after a provider: gmail.comakash, rediffmail.com123
+    # (not me.company.in — the tail must have no dot of its own)
+    for known in _KNOWN_LONGEST_FIRST:
+        rest = domain[len(known):]
+        if domain.startswith(known) and (
+                "." not in rest or (rest.startswith(".") and known in _NO_COUNTRY_DOMAINS)):
+            return known
     label, _, ending = domain.partition(".")
     if label in _PROVIDER_LABELS:
-        # Gmail has no country domains, so gmail.co / gmail.in / gmail.comakash
+        # Gmail has no country domains, so gmail.co / gmail.in / gmail.c9m
         # are slips; yahoo.fr, hotmail.ca, outlook.de are real addresses.
         if label in ("gmail", "googlemail") or ending in _COM_TYPOS or (
-                ending.startswith("com") and ending[3:].isalpha()):
+                ending.startswith("com") and ending[3:].isalnum()):
             return _PROVIDER_LABELS[label]
         return None
+    # any other domain: company.comakash -> company.com
+    head, _, last = domain.rpartition(".")
+    junk = re.fullmatch(r"(com|net|org)[a-z0-9]+", last)
+    if head and junk and last not in _TLDS_LIKE_JUNK:
+        return f"{head}.{junk.group(1)}"
     best = min(_COMMON_DOMAINS, key=lambda k: _edit_distance(domain, k))
     allowed = 2 if len(domain) >= 8 else 1  # short domains: one slip at most
     return best if _edit_distance(domain, best) <= allowed else None
@@ -272,6 +292,150 @@ def suggest_domain_fix(email):
     local, _, domain = email.rpartition("@")
     fixed = _fix_domain(domain.lower())
     return f"{local}@{fixed}" if fixed else None
+
+
+def _looks_like_com(ending):
+    """'c', 'co', 'cm', 'c9m', 'con', 'comakash' … — a mangled '.com' (or none)."""
+    return (ending == "" or "com".startswith(ending) or ending in _COM_TYPOS
+            or ending.startswith("com") or (len(ending) == 3 and _edit_distance(ending, "com") <= 1))
+
+
+def _common_letters(a, b):
+    """Length of the longest run of letters a and b share in order."""
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b, 1):
+            cur.append(prev[j - 1] + 1 if ca == cb else max(prev[j], cur[j - 1]))
+        prev = cur
+    return prev[-1]
+
+
+def _repair_domain(domain):
+    """(domain, what was wrong) for the domain of an address that is broken,
+    or (None, None)."""
+    if domain in _KNOWN_DOMAINS:
+        return None, None
+    if "." not in domain:
+        # gmailcom -> gmail.com, gmail -> gmail.com
+        head = re.fullmatch(r"(.+?)(com|net|org)", domain)
+        if head:
+            dotted = f"{head.group(1)}.{head.group(2)}"
+            return _fix_domain(dotted) or dotted, "missing dot before com"
+        if domain in _PROVIDER_LABELS:
+            if domain == "yahoo":  # yahoo.com / yahoo.in / yahoo.co.in — can't tell
+                return None, None
+            return _PROVIDER_LABELS[domain], "missing .com"
+    fixed = _fix_domain(domain)
+    if fixed:
+        return fixed, ("text after .com" if domain.startswith(fixed) else "misspelt domain")
+    label, _, ending = domain.partition(".")
+    if _looks_like_com(ending):
+        # gmil.c -> gmail.com: a provider name one slip away, and a mangled .com
+        for name, provider in _PROVIDER_LABELS.items():
+            if name != "yahoo" or ending:
+                if _edit_distance(label, name) <= (1 if len(name) <= 5 else 2):
+                    return provider, "misspelt domain"
+        # gimill, gam … : an address that is already broken is far likelier to
+        # be a mangled gmail than a real "g…" company domain — but with a
+        # proper ending, ask for most of g-m-a-i-l so gem.com is left alone
+        if (label.startswith("g") and 3 <= len(label) <= 7
+                and _edit_distance(label, "gmail") <= 3
+                and (not ending or _common_letters(label, "gmail") >= 4)):
+            return "gmail.com", "misspelt domain"
+    return None, None
+
+
+def _repair_address(text):
+    """(address, [what was wrong]) for one broken address, or (None, …)."""
+    issues = []
+
+    def step(new, issue):
+        nonlocal text
+        if new != text:
+            issues.append(issue)
+            text = new
+
+    text = text.strip(_TOKEN_STRIP)
+    if text.lower().startswith("mailto:"):
+        text = text[7:]
+    step(re.sub(r"\s+", "", text), "spaces")
+    step(re.sub(r"[\\\"()<>\[\]:]", "", text), "stray symbol")
+    # a comma / semicolon typed for a dot, or stuck to the @
+    step(re.sub(r"[,;|]+", ".", re.sub(r"[,;|]+(?=@)|(?<=@)[,;|]+", "", text)),
+         "comma instead of dot")
+    step(re.sub(r"\.*@\.*", "@", re.sub(r"\.{2,}", ".", text)).strip("."), "extra dots")
+    if "@" not in text:
+        lowered = text.lower()
+        for known in _KNOWN_LONGEST_FIRST:
+            if lowered.endswith(known) and len(text) > len(known) + 1:
+                step(text[:-len(known)].rstrip(".") + "@" + known, "missing @")
+                break
+        else:
+            # name.company.com: the first dot was meant to be the @
+            if not re.fullmatch(r"[^.]+\.[^.]+\.[a-z]{2,}(\.[a-z]{2})?", lowered):
+                return None, issues
+            step(text.replace(".", "@", 1), "missing @")
+    if text.count("@") > 1:
+        *names, domain = text.split("@")
+        step(".".join(n for n in names if n) + "@" + domain, "two @ signs")
+    local, _, domain = text.partition("@")
+    if not local:
+        return None, issues
+    domain = domain.lower()
+    fixed, issue = _repair_domain(domain)
+    if fixed:
+        domain = fixed
+        issues.append(issue)
+    elif not is_valid_email(f"{local}@{domain}"):
+        return None, issues
+    address = f"{local}@{domain}"
+    return (address, issues) if is_valid_email(address) else (None, issues)
+
+
+def suggest_cell_fixes(value):
+    """Corrected addresses for an invalid cell, as [(address, what was wrong)],
+    or [] if it can't be worked out.
+
+    Fixes stray spaces and symbols, commas typed for dots, doubled dots, a
+    missing "@" before a known provider (ahanish782gmail.com), two "@" signs,
+    a missing dot or ".com" (@gmailcom, @gmail), text typed after ".com"
+    (@gmail.comakash) and misspelt domains. A cell holding several addresses
+    is fixed address by address; if any of them can't be worked out, nothing
+    is suggested.
+    """
+    text = (value or "").strip()
+    if not text:
+        return []
+    if text.count("@") > 1:
+        # several addresses: glue fragments without an @ onto the address
+        # before them ("a@x.com b@gmail. com" -> a@x.com, b@gmail.com)
+        tokens, glued = [], set()
+        for piece in re.split(r"[,;|/\s]+", text):
+            if tokens and piece and ("@" not in piece or "@" not in tokens[-1]):
+                tokens[-1] += piece
+                glued.add(len(tokens) - 1)
+            elif piece:
+                tokens.append(piece)
+        if len(tokens) == 1:
+            tokens, glued = [text], set()  # one address with two @ signs
+        several = len(tokens) > 1
+    else:
+        tokens, glued, several = [text], set(), False
+    fixes = []
+    for n, token in enumerate(tokens):
+        if is_valid_email(token) and not suggest_domain_fix(token):
+            issues = ["spaces"] if n in glued else []
+        else:
+            token, issues = _repair_address(token)
+            if not token:
+                return []
+            if n in glued:
+                issues = ["spaces"] + issues
+        if several:
+            issues.append("several addresses in one cell")
+        fixes.append((token, ", ".join(dict.fromkeys(issues))))
+    return fixes
 
 
 def detect_email_columns(df, sample=2000):
@@ -356,8 +520,11 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
       addresses      valid addresses found, duplicates included
       duplicates     addresses dropped because they were already in the list
       problems       [{row, name, value, issue}] rows that are blank or invalid
+      fixable        [{key, email, fixed_from, problem, name, detail, rows}]
+                     corrected addresses for invalid cells (see
+                     suggest_cell_fixes) that aren't already in recipients
     """
-    found = {}
+    found, fixable, fixed_rows = {}, {}, []
     rows_valid = rows_blank = rows_invalid = addresses = 0
     problems = []
     names = df[name_col].tolist() if name_col else [""] * len(df)
@@ -375,13 +542,25 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
             v, bad = parse_email_cell(cell)
             valid += v
             invalid += bad
+        detail = " / ".join(col[i] for col in detail_values if col[i])
+        fixes = {cell: suggest_cell_fixes(cell) for cell in invalid}
+        for cell, cell_fixes in fixes.items():
+            for fix, issue in cell_fixes:
+                entry = fixable.setdefault(fix.lower(), {
+                    "key": fix.lower(), "email": fix, "fixed_from": cell,
+                    "problem": issue or "invalid email", "name": names[i],
+                    "detail": detail, "rows": 0})
+                entry["rows"] += 1
         if invalid:
+            problem = {"row": row_no, "name": names[i], "value": " | ".join(invalid),
+                       "issue": "invalid email" + (" in one column" if valid else "")}
+            problems.append(problem)
+            if all(fixes.values()):
+                fixed_rows.append((problem, [f.lower() for fx in fixes.values() for f, _ in fx]))
+        if not valid:
             rows_invalid += 1
-            problems.append({"row": row_no, "name": names[i], "value": " | ".join(cells),
-                             "issue": "invalid email"})
             continue
         rows_valid += 1
-        detail = " / ".join(col[i] for col in detail_values if col[i])
         for email in valid:
             addresses += 1
             key = email.lower()
@@ -390,6 +569,9 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
             else:
                 found[key] = {"key": key, "email": email, "name": names[i],
                               "detail": detail, "rows": 1}
+    for problem, keys in fixed_rows:
+        problem["issue"] += (" (the corrected address is already in the list)"
+                             if all(k in found for k in keys) else " (fix suggested below)")
     return {
         "recipients": list(found.values()),
         "rows": len(df),
@@ -399,6 +581,7 @@ def extract_recipients(df, email_cols, name_col=None, detail_cols=()):
         "addresses": addresses,
         "duplicates": addresses - len(found),
         "problems": problems,
+        "fixable": [f for k, f in fixable.items() if k not in found],
     }
 
 
