@@ -1,3 +1,10 @@
 .venv
 configuration.env
 .env
+__pycache__/
+# recipient lists hold personal data — keep them out of this public repo
+*.csv
+*.tsv
+*.xlsx
+*.xlsm
+*.xls

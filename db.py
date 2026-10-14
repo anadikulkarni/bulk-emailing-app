@@ -100,7 +100,8 @@ def save_remainder(label, retailer_type, subject, body,
             "attachment_data, recipients, created_by) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (label, retailer_type, subject, body, attachment_name,
-             attachment_bytes, json.dumps(recipients), created_by)
+             bytearray(attachment_bytes) if attachment_bytes else None,
+             json.dumps(recipients), created_by)
         )
         conn.commit()
 
@@ -170,12 +171,14 @@ def get_verified_list_meta():
         return cursor.fetchone()
 
 def get_verified_list_data(list_id):
+    """The stored file, or None if that upload no longer exists."""
     with get_conn_ctx() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT file_data FROM VERIFIED_DISTRIBUTOR_LISTS WHERE id = %s", (list_id,)
         )
-        return bytes(cursor.fetchone()[0])
+        row = cursor.fetchone()
+        return bytes(row[0]) if row else None
 
 def save_verified_list(filename, file_bytes, row_count, uploaded_by):
     with get_conn_ctx() as conn:
@@ -184,6 +187,8 @@ def save_verified_list(filename, file_bytes, row_count, uploaded_by):
         cursor.execute(
             "INSERT INTO VERIFIED_DISTRIBUTOR_LISTS "
             "(filename, file_data, row_count, uploaded_by) VALUES (%s,%s,%s,%s)",
-            (filename, file_bytes, row_count, uploaded_by)
+            # bytearray: pymssql sends plain ASCII bytes as text, which SQL
+            # Server won't put into a VARBINARY column
+            (filename, bytearray(file_bytes), row_count, uploaded_by)
         )
         conn.commit()

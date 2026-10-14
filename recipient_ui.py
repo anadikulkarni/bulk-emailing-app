@@ -2,7 +2,8 @@
 
 recipient_picker  — the select / deselect list shared by every recipient mode
 dataset_picker    — recipients from a table: email column, column filters, counts
-file_picker       — dataset_picker for a freshly uploaded CSV / Excel file
+file_picker       — dataset_picker for an uploaded CSV / Excel file
+keep, keep_alive  — keep widget choices while a widget is off screen
 """
 import hashlib
 import re
@@ -14,14 +15,42 @@ import dataset
 
 PAGE_SIZE = 100
 # columns with more distinct values than this get a "contains" box, not a list
-MAX_FILTER_OPTIONS = 300
+MAX_FILTER_OPTIONS = 2000
 
 HEADER_CHOICES = ["Auto-detect", "No header row"] + [f"Row {i}" for i in range(1, 11)]
+_KEPT = "_kept_widget_keys"
+
+
+# ---------- keeping widget state ----------
+def keep(key):
+    """Register a widget key whose value must survive reruns where the widget
+    isn't drawn (another recipient mode or page, a filter that hides it).
+    Streamlit otherwise forgets it. Returns the key."""
+    st.session_state.setdefault(_KEPT, set()).add(key)
+    return key
+
+
+def keep_alive():
+    """Call once per run, before any widget is drawn."""
+    for key in list(st.session_state.get(_KEPT, ())):
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+
+def _first_time(key, **defaults):
+    """Widget defaults, only for the run that creates the widget (Streamlit
+    warns when a default meets a value already in session state)."""
+    return {} if key in st.session_state else defaults
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
 def load_table(data, filename, sheet=None, header_row="auto"):
     return dataset.read_table(data, filename, sheet, header_row)
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def _sheet_names(data, filename):
+    return dataset.sheet_names(data, filename)
 
 
 def file_token(data):
@@ -32,10 +61,10 @@ def _md_escape(text):
     return re.sub(r"([\\`*_{}\[\]<>()#+\-.!|~$])", r"\\\1", text)
 
 
-def _clear_checkboxes(ns, emails=None):
+def _clear_checkboxes(ns, keys=None):
     prefix = f"{ns}_chk_"
     for key in [k for k in st.session_state.keys() if str(k).startswith(prefix)]:
-        if emails is None or key[len(prefix):] in emails:
+        if keys is None or key[len(prefix):] in keys:
             del st.session_state[key]
 
 
@@ -43,31 +72,36 @@ def _clear_checkboxes(ns, emails=None):
 def recipient_picker(recipients, ns, reset_token):
     """Let the user tick / untick individual recipients (all ticked to start).
 
-    recipients: [{"email", "name", "detail"?}] with unique emails.
-    Choices are remembered per address until reset_token changes.
+    recipients: [{"email", "name", "detail"?, "key"?, "fixed_from"?}] with
+    unique emails. Ticks are remembered per key (default: the lower-cased
+    address) until reset_token changes — a stable key keeps an untick when the
+    shown address changes, e.g. after a typo correction.
     Returns the ticked addresses, in list order.
     """
     sel_key, page_key = f"{ns}_selections", f"{ns}_page"
     search_key, last_search_key = f"{ns}_search", f"{ns}_last_search"
     prefix = f"{ns}_chk_"
 
-    if st.session_state.get(f"{ns}_token") != reset_token:
+    if sel_key not in st.session_state or st.session_state.get(f"{ns}_token") != reset_token:
         st.session_state[f"{ns}_token"] = reset_token
         st.session_state[sel_key] = {}
         st.session_state[page_key] = 0
-        st.session_state[last_search_key] = ""
-        st.session_state.pop(search_key, None)
+        st.session_state[last_search_key] = None
+        st.session_state[search_key] = ""  # also clears the box in the browser
         _clear_checkboxes(ns)
+
+    def rkey(r):
+        return r.get("key") or r["email"].lower()
 
     selections = st.session_state[sel_key]
     for r in recipients:
         # a checkbox clicked on the last run holds the newest value
-        if prefix + r["email"] in st.session_state:
-            selections[r["email"]] = st.session_state[prefix + r["email"]]
-        selections.setdefault(r["email"], True)
+        if prefix + rkey(r) in st.session_state:
+            selections[rkey(r)] = st.session_state[prefix + rkey(r)]
+        selections.setdefault(rkey(r), True)
 
     total = len(recipients)
-    selected_count = sum(1 for r in recipients if selections[r["email"]])
+    selected_count = sum(1 for r in recipients if selections[rkey(r)])
     st.info(f"{selected_count} of {total} recipients selected.")
 
     with st.expander("Preview & select recipients"):
@@ -84,8 +118,8 @@ def recipient_picker(recipients, ns, reset_token):
         for col, label, value in [(col_a, "Select all", True), (col_b, "Deselect all", False)]:
             if col.button(label, key=f"{ns}_{'sel' if value else 'desel'}_all"):
                 for r in filtered:
-                    selections[r["email"]] = value
-                _clear_checkboxes(ns, {r["email"] for r in filtered})
+                    selections[rkey(r)] = value
+                _clear_checkboxes(ns, {rkey(r) for r in filtered})
                 st.rerun()
 
         st.text_input("Search by name or email", key=search_key)
@@ -93,7 +127,7 @@ def recipient_picker(recipients, ns, reset_token):
             st.caption(f"Select all / Deselect all apply to the {len(filtered)} matches.")
 
         # reset to page 0 when search or the list changes
-        list_sig = hashlib.md5("\n".join(r["email"] for r in recipients).encode()).hexdigest()
+        list_sig = hashlib.md5("\n".join(rkey(r) for r in recipients).encode()).hexdigest()
         if (search, list_sig) != st.session_state[last_search_key]:
             st.session_state[page_key] = 0
             st.session_state[last_search_key] = (search, list_sig)
@@ -120,36 +154,38 @@ def recipient_picker(recipients, ns, reset_token):
 
         # checkboxes for this page only; their state seeds from `selections`
         for r in page_slice:
-            key = prefix + r["email"]
+            key = prefix + rkey(r)
             if key not in st.session_state:
-                st.session_state[key] = selections[r["email"]]
+                st.session_state[key] = selections[rkey(r)]
             label = f"{r['name']}  —  {r['email']}" if r["name"] else r["email"]
+            if r.get("fixed_from"):
+                label += f"  ✏️ corrected from {r['fixed_from']}"
             if r.get("detail"):
                 label += f"  ·  {r['detail']}"
             st.checkbox(_md_escape(label), key=key)
 
-    return [r["email"] for r in recipients if selections[r["email"]]]
+    return [r["email"] for r in recipients if selections[rkey(r)]]
 
 
 # ---------- recipients from a table ----------
 def _value_filter(df, base, col, key):
-    """Multiselect of a column's values, limited to the rows left in `base`."""
-    keys, display, counts = dataset.value_options(base[col])
-    chosen = st.session_state.get(key, [])
-    if any(k not in counts for k in chosen):
-        # keep earlier choices visible (with a 0 count) so they can be removed
-        _, all_display, _ = dataset.value_options(df[col])
-        for k in chosen:
-            if k not in counts:
-                keys.append(k)
-                display[k] = all_display.get(k, k)
+    """Multiselect of a column's values, limited to the rows left in `base`.
+
+    Labels come from the whole column so they are identical on every run: the
+    browser hands back the label text, and a label that changed (say, a count
+    in it) would no longer match and the choice would silently drop out.
+    """
+    _, display, _ = dataset.value_options(df[col])
+    keys, _, counts = dataset.value_options(base[col])
+    # keep earlier choices listed (even if nothing matches now) so they can be removed
+    keys += [k for k in st.session_state.get(key, []) if k not in counts]
     return st.multiselect(
-        col, keys, key=key, placeholder="All",
-        format_func=lambda k: f"{display.get(k) or '(blank)'}  ({counts.get(k, 0)})",
+        col, keys, key=keep(key), placeholder="All",
+        format_func=lambda k: display.get(k) or "(blank)",
     )
 
 
-def _problem_rows(problems, title):
+def _problem_rows(problems, title, hint):
     if not problems:
         return
     with st.expander(title):
@@ -159,11 +195,57 @@ def _problem_rows(problems, title):
             }),
             hide_index=True, width="stretch",
         )
-        st.caption("Fix these in the file and re-upload, or type the right address "
-                   "into the manual box.")
+        st.caption(hint)
 
 
-def dataset_picker(df, ns, source_id, default_filters=None, settings=None):
+def _typo_fixes(full, result, t):
+    """Flag addresses whose domain looks misspelt (gmai.com …) and, if the user
+    opts in, swap in the corrected address. Returns the recipient list to use.
+
+    Suggestions come from the whole file, so the opt-in stays on screen (and
+    on) while filters change. Corrected recipients keep their original key, so
+    anyone already unticked stays unticked.
+    """
+    fixes = {}
+    for r in full["recipients"]:
+        fix = dataset.suggest_domain_fix(r["email"])
+        if fix:
+            fixes[r["key"]] = fix
+    recipients = result["recipients"]
+    if not fixes:
+        return recipients
+    in_view = [r for r in recipients if r["key"] in fixes]
+    n = len(in_view)
+    title = (f"🔤 {n} address{'es look' if n != 1 else ' looks'} like a misspelt email "
+             "domain (e.g. gmai.com) and will probably bounce" if in_view
+             else "🔤 Misspelt email domains: none in the filtered rows")
+    with st.expander(title):
+        if in_view:
+            st.dataframe(
+                pd.DataFrame([{"Name": r["name"], "Address in file": r["email"],
+                               "Suggested": fixes[r["key"]]} for r in in_view]),
+                hide_index=True, width="stretch",
+            )
+        use_fixes = st.checkbox("Send to the suggested addresses instead",
+                                key=keep(f"{t}_typo_fix"))
+        st.caption("Corrected addresses are marked ✏️ in the list below, where any of "
+                   "them can still be unticked.")
+    if not use_fixes:
+        return recipients
+    fixed, seen = [], {r["email"].lower() for r in recipients if r["key"] not in fixes}
+    for r in recipients:
+        if r["key"] in fixes:
+            if fixes[r["key"]].lower() in seen:
+                continue  # the corrected address is already on the list
+            seen.add(fixes[r["key"]].lower())
+            r = {**r, "email": fixes[r["key"]], "fixed_from": r["email"]}
+        fixed.append(r)
+    return fixed
+
+
+def dataset_picker(df, ns, source_id, default_filters=None, settings=None,
+                   problem_hint="Fix these in the file and upload it again.",
+                   no_email_hint=""):
     """Pick recipients out of a table.
 
     Finds the email column, reports how many addresses were pulled (and what was
@@ -178,29 +260,37 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None):
     settings = settings or st.expander("⚙️ Column settings")
 
     with settings:
+        key = keep(f"{t}_email_cols")
         email_cols = st.multiselect(
-            "Email column(s)", columns, default=detected[:1], key=f"{t}_email_cols",
+            "Email column(s)", columns, key=key,
             help="Columns the addresses are read from. Pick more than one to "
                  "include addresses from each.",
+            **_first_time(key, default=dataset.default_email_columns(detected)),
         )
         name_default = dataset.detect_name_column(df, email_cols)
         name_options = ["(none)"] + columns
+        key = keep(f"{t}_name_col")
         name_col = st.selectbox(
-            "Name column (shown next to each address)", name_options,
-            index=name_options.index(name_default) if name_default else 0,
-            key=f"{t}_name_col",
+            "Name column (shown next to each address)", name_options, key=key,
+            **_first_time(key, index=name_options.index(name_default) if name_default else 0),
         )
         name_col = None if name_col == "(none)" else name_col
         st.caption("First rows of the file:")
         st.dataframe(df.head(10), width="stretch")
 
     if not email_cols:
-        st.warning("Couldn't find an email column — choose it under ⚙️ Column settings.")
+        st.warning("Couldn't find a column with email addresses — choose it under "
+                   f"⚙️ settings above.{no_email_hint}")
         return []
-    extra = [c for c in detected if c not in email_cols]
-    if extra:
-        st.caption(f"Other columns that look like emails: {', '.join(extra)} — add them "
-                   "under ⚙️ Column settings to include them.")
+
+    merged = df.attrs.get("merged_rows") or []
+    if merged:
+        st.warning(
+            f"Row{'s' if len(merged) > 1 else ''} {', '.join(map(str, merged[:10]))} "
+            "seem to have swallowed the lines after them — usually a stray quote "
+            "mark (\") in the file. Those lines aren't counted as separate rows; "
+            "fix the quote and upload the file again."
+        )
 
     full = dataset.extract_recipients(df, email_cols, name_col)
     m1, m2, m3, m4 = st.columns(4)
@@ -215,25 +305,38 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None):
         f"{full['duplicates']:,} repeats merged → {len(full['recipients']):,} unique."
     )
 
+    extra = [c for c in detected if c not in email_cols]
+    if extra:
+        have = {r["key"] for r in full["recipients"]}
+        left_out = [r for r in dataset.extract_recipients(df, extra)["recipients"]
+                    if r["key"] not in have]
+        if left_out:
+            st.warning(
+                f"{len(left_out):,} more addresses are in **{', '.join(extra)}**, which "
+                "isn't being read. Add it under ⚙️ settings above to include them."
+            )
+    for col, n_no in dataset.flag_columns_with_no(df):
+        st.warning(f"{n_no:,} rows have **{col}** set to FALSE / No and are included. "
+                   f"Add {col} under *Filter by* to leave them out.")
+
     # ----- filters -----
     filterable = [c for c in columns if c not in email_cols]
     if default_filters is None:
         default_filters = dataset.detect_location_columns(df, email_cols)
+    key = keep(f"{t}_filter_cols")
     filter_cols = st.multiselect(
-        "Filter by", filterable,
-        default=[c for c in default_filters if c in filterable],
-        key=f"{t}_filter_cols",
+        "Filter by", filterable, key=key, placeholder="Pick columns to filter on (e.g. Area)",
         help="Pick columns to filter on, then choose the values to keep. Each filter "
              "lists only the values left after the filters above it; leaving one "
              "empty keeps every value.",
+        **_first_time(key, default=[c for c in default_filters if c in filterable]),
     )
 
-    text_cols = {c for c in filter_cols if df[c].map(dataset.norm).nunique() > MAX_FILTER_OPTIONS}
     value_filters, text_filters = {}, {}
     for col in filter_cols:
-        if col in text_cols:
+        if df[col].map(dataset.norm).nunique() > MAX_FILTER_OPTIONS:
             text_filters[col] = st.text_input(
-                f"{col} contains", key=f"{t}_ft_{col}",
+                f"{col} contains", key=keep(f"{t}_ft_{col}"),
                 help="Comma-separate several terms to match any of them.",
             )
         else:
@@ -243,8 +346,7 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None):
 
     matched = dataset.apply_filters(df, value_filters, text_filters)
     result = dataset.extract_recipients(matched, email_cols, name_col, detail_cols=filter_cols)
-    filtering = len(matched) != len(df) or any(value_filters.values()) or any(
-        v.strip() for v in text_filters.values())
+    filtering = any(value_filters.values()) or any(v.strip() for v in text_filters.values())
     if filtering:
         st.success(
             f"Filters match **{len(matched):,}** of {len(df):,} rows → "
@@ -255,56 +357,37 @@ def dataset_picker(df, ns, source_id, default_filters=None, settings=None):
         result["problems"],
         f"⚠️ {len(result['problems']):,} {'matching ' if filtering else ''}rows with a "
         "missing or invalid email",
+        problem_hint,
     )
-    recipients = _typo_fixes(result["recipients"], t)
+    recipients = _typo_fixes(full, result, t)
 
     return recipient_picker(recipients, ns, reset_token=(t, tuple(email_cols)))
 
 
-def _typo_fixes(recipients, t):
-    """Flag addresses whose domain looks misspelt (gmai.com …) and, if the user
-    opts in, swap in the corrected address. Returns the recipient list to use."""
-    fixes = {r["email"]: dataset.suggest_domain_fix(r["email"]) for r in recipients}
-    fixes = {e: f for e, f in fixes.items() if f}
-    if not fixes:
-        return recipients
-    with st.expander(f"🔤 {len(fixes)} addresses look like a misspelt email domain "
-                     "(e.g. gmai.com) and will probably bounce"):
-        st.dataframe(
-            pd.DataFrame([{"Name": r["name"], "Address in file": r["email"],
-                           "Suggested": fixes[r["email"]]}
-                          for r in recipients if r["email"] in fixes]),
-            hide_index=True, width="stretch",
-        )
-        use_fixes = st.checkbox("Send to the suggested addresses instead", key=f"{t}_typo_fix")
-    if not use_fixes:
-        return recipients
-    fixed, seen = [], set()
-    for r in recipients:
-        email = fixes.get(r["email"], r["email"])
-        if email.lower() not in seen:
-            seen.add(email.lower())
-            fixed.append({**r, "email": email})
-    return fixed
+def pick_sheet(data, filename, key):
+    """Sheet selectbox for a multi-sheet workbook (defaulting to the first sheet
+    that has an email column). Returns the sheet name, or None for CSV."""
+    sheets = _sheet_names(data, filename)
+    if len(sheets) < 2:
+        return None
+    default = next((i for i, s in enumerate(sheets)
+                    if dataset.detect_email_columns(load_table(data, filename, s))), 0)
+    return st.selectbox("Sheet", sheets, key=keep(key), **_first_time(key, index=default))
 
 
-def file_picker(uploaded, ns, default_filters=()):
-    """dataset_picker for a file from st.file_uploader. Returns selected addresses."""
-    data = uploaded.getvalue()
+def file_picker(filename, data, ns, default_filters=None):
+    """dataset_picker for an uploaded file. Returns selected addresses."""
     token = file_token(data)
     try:
-        sheets = dataset.sheet_names(data, uploaded.name)
+        sheet = pick_sheet(data, filename, f"{ns}_{token}_sheet")
     except Exception as e:
-        st.error(f"Couldn't open {uploaded.name}: {e}")
+        st.error(f"Couldn't open {filename}: {e}")
         return []
-    sheet = None
-    if len(sheets) > 1:
-        sheet = st.selectbox("Sheet", sheets, key=f"{ns}_{token}_sheet")
 
     settings = st.expander("⚙️ File & column settings")
     with settings:
         header_choice = st.selectbox(
-            "Header row", HEADER_CHOICES, key=f"{ns}_{token}_header",
+            "Header row", HEADER_CHOICES, key=keep(f"{ns}_{token}_header"),
             help="Which row holds the column names. Auto-detect skips title rows "
                  "and spots files with no header at all.",
         )
@@ -312,13 +395,18 @@ def file_picker(uploaded, ns, default_filters=()):
         header_choice, HEADER_CHOICES.index(header_choice) - 2)
 
     try:
-        df = load_table(data, uploaded.name, sheet, header_row)
+        df = load_table(data, filename, sheet, header_row)
     except Exception as e:
-        st.error(f"Couldn't read {uploaded.name}: {e}")
+        st.error(f"Couldn't read {filename}: {e}")
         return []
     if df.empty:
-        st.warning(f"{uploaded.name} has no rows.")
+        st.warning(f"{filename} has no rows" + (f" on sheet {sheet}." if sheet else "."))
         return []
 
-    return dataset_picker(df, ns, source_id=f"{token}_{sheet}_{header_row}",
-                          default_filters=default_filters, settings=settings)
+    return dataset_picker(
+        df, ns, source_id=f"{token}_{sheet}_{header_row}",
+        default_filters=default_filters, settings=settings,
+        problem_hint="Fix these in the file and upload it again, or type the right "
+                     "addresses into the box below.",
+        no_email_hint=" If the addresses are on another sheet, pick it under Sheet." if sheet else "",
+    )
