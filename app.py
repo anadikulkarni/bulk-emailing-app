@@ -1,6 +1,8 @@
 import streamlit as st
 import auth
 import db
+import dataset
+import recipient_ui
 import os
 import json
 import uuid
@@ -42,6 +44,9 @@ if "user" not in st.session_state:
     st.stop()
 
 user = st.session_state.user
+# keep recipient choices (filters, typed addresses …) while their widgets are off screen
+recipient_ui.keep_alive()
+custom_uploader_was_shown = st.session_state.pop("custom_uploader_shown", False)
 st.sidebar.write(f"Signed in as **{user['username']}** ({user['role']})")
 if st.sidebar.button("Log out"):
     del st.session_state.user
@@ -76,6 +81,143 @@ with st.sidebar.expander("🧪 Send test email"):
             else:
                 st.error(f"Failed: {err}")
 
+@st.cache_data(show_spinner="Loading verified distributors…", max_entries=3)
+def load_verified_list(list_id, uploaded_at):
+    """(table, CSV for download) of a stored list, or None if it was deleted.
+    uploaded_at is part of the cache key so a reused id can't serve old data."""
+    data = db.get_verified_list_data(list_id)
+    if data is None:
+        return None
+    df = dataset.read_saved_table(data)
+    return df, dataset.to_csv_bytes(df)
+
+def verified_upload_box(current):
+    """Upload box that replaces the verified distributors list."""
+    if "verified_upload_nonce" not in st.session_state:
+        st.session_state.verified_upload_nonce = 0
+    st.caption(
+        "Upload a fresh CSV or Excel export when the list changes. It replaces the "
+        "list for everyone using the app (earlier uploads stay in the database). "
+        "Any extra columns it has — not just Area and City — can be used as filters."
+    )
+    up = st.file_uploader(
+        "Verified distributors file", type=dataset.FILE_TYPES,
+        key=f"verified_upload_{st.session_state.verified_upload_nonce}",
+    )
+    if not up:
+        return
+    data = up.getvalue()
+    try:
+        sheet = recipient_ui.pick_sheet(data, up.name, "verified_upload_sheet")
+        new_df = recipient_ui.load_table(data, up.name, sheet)
+    except Exception as e:
+        st.error(f"Couldn't read {up.name}: {e}")
+        return
+    email_cols = dataset.detect_email_columns(new_df)
+    found = dataset.extract_recipients(new_df, email_cols[:1]) if email_cols else None
+    if new_df.empty:
+        st.error(f"{up.name} has no rows.")
+        return
+    if not found or not found["recipients"]:
+        st.error(f"Couldn't find any email addresses in {up.name} — check the file.")
+        return
+    filters = dataset.detect_location_columns(new_df, email_cols)
+    st.write(
+        f"**{len(new_df):,}** rows · **{len(found['recipients']):,}** unique "
+        f"emails in **{email_cols[0]}** · filters: "
+        f"{', '.join(filters) or 'none detected (any column can still be used)'}"
+    )
+    st.caption(f"Columns: {', '.join(new_df.columns)}")
+    if current and len(new_df) < 0.5 * current["row_count"]:
+        st.warning(f"This file has far fewer rows than the current list "
+                   f"({len(new_df):,} vs {current['row_count']:,}) — is it the right one?")
+    label = "Replace the current list" if current else "Save as the verified list"
+    if st.button(label, type="primary", key="verified_save"):
+        try:
+            db.save_verified_list(
+                up.name, dataset.to_csv_bytes(new_df, row_numbers=True), len(new_df),
+                user["username"],
+            )
+        except Exception as e:
+            st.error(f"Couldn't save the list: {e}")
+        else:
+            st.session_state.verified_upload_nonce += 1
+            st.session_state.pop("verified_list", None)  # switch to the new list
+            st.session_state.verified_flash = (
+                f"Verified distributors list updated from {up.name} ({len(new_df):,} rows)."
+            )
+            st.rerun()
+
+def verified_distributor_recipients():
+    """Recipients from the stored verified distributors list, plus the upload
+    box that replaces that list. Returns the selected addresses.
+
+    The session sticks to the list it started with, so a colleague uploading a
+    new one can't swap the list (and reset the filters) mid-compose."""
+    try:
+        newest = db.get_verified_list_meta()
+    except Exception as e:
+        st.error(
+            f"Couldn't load the verified distributors list: {e}\n\n"
+            f"If the table is missing, create it with:\n\n`{db.VERIFIED_LISTS_DDL}`"
+        )
+        return []
+    if newest and "verified_list" not in st.session_state:
+        st.session_state.verified_list = newest
+    current = st.session_state.get("verified_list")
+
+    flash = st.session_state.pop("verified_flash", None)
+    if flash:
+        st.success(flash)
+    if current:
+        st.caption(
+            f"Using **{current['filename']}** — {current['row_count']:,} rows, uploaded by "
+            f"{current['uploaded_by']} on {current['uploaded_at']:%Y-%m-%d %H:%M}."
+        )
+        if newest and newest["id"] != current["id"]:
+            st.warning(
+                f"A newer list ({newest['filename']}) was uploaded by "
+                f"{newest['uploaded_by']} on {newest['uploaded_at']:%Y-%m-%d %H:%M}. "
+                "You're still on the one above, so your filters and ticks are unchanged."
+            )
+            if st.button("Switch to the newer list", key="verified_switch"):
+                st.session_state.verified_list = newest
+                st.rerun()
+    else:
+        st.info("No verified distributors list yet. Upload the CSV / Excel file below to set it up.")
+
+    loaded = None
+    if current:
+        try:
+            loaded = load_verified_list(current["id"], str(current["uploaded_at"]))
+        except Exception as e:
+            st.error(f"Couldn't load the verified distributors list: {e}")
+            return []
+        if loaded is None:
+            st.session_state.pop("verified_list", None)
+            st.warning("The list you were using is no longer in the database. "
+                       "Reload the page to pick up the current one.")
+            return []
+
+    with st.expander(
+        "⬆️ Upload an updated list" if current else "⬆️ Upload the verified distributors list",
+        expanded=not current,
+    ):
+        verified_upload_box(current)
+        if loaded:
+            st.download_button(
+                "Download the current list (CSV)", loaded[1],
+                file_name=f"{current['filename'].rsplit('.', 1)[0]}.csv", mime="text/csv",
+            )
+
+    if not loaded:
+        return []
+    return recipient_ui.dataset_picker(
+        loaded[0], "verified", source_id=str(current["id"]),
+        problem_hint="Fix these in your copy of the list and upload it again "
+                     "(row numbers match the file that was uploaded).",
+    )
+
 pages = ["Compose & Send", "Pending Sends", "Activity Log"]
 if user["role"] == "admin":
     pages.append("Admin")
@@ -91,123 +233,78 @@ if page == "Compose & Send":
         st.session_state.sending = False
     if "staged" not in st.session_state:
         st.session_state.staged = None
-    if "recipient_selections" not in st.session_state:
-        st.session_state.recipient_selections = {}
-    if "last_rtype" not in st.session_state:
-        st.session_state.last_rtype = None
-    if "recipient_page" not in st.session_state:
-        st.session_state.recipient_page = 0
-    if "last_search" not in st.session_state:
-        st.session_state.last_search = ""
 
-    recipient_mode = st.radio("Recipients", ["Retailer Type", "Custom"], horizontal=True)
+    recipient_mode = st.radio(
+        "Recipients", ["Retailer Type", "Custom", "Verified Distributors"], horizontal=True,
+        key=recipient_ui.keep("recipient_mode"),
+    )
 
     if recipient_mode == "Retailer Type":
         rtype = st.selectbox("Retailer Type", db.get_retailer_types())
-
-        # reset checkboxes and pagination when retailer type changes
-        if rtype != st.session_state.last_rtype:
-            st.session_state.last_rtype = rtype
-            st.session_state.recipient_selections = {}
-            st.session_state.recipient_page = 0
-            st.session_state.last_search = ""
-
         all_recipients = db.get_emails_for_type(rtype) if rtype else []
+        # selections reset when the retailer type changes
+        recipients = recipient_ui.recipient_picker(all_recipients, "rt", reset_token=rtype)
 
-        # initialise selections for any new entries (default all checked)
-        for r in all_recipients:
-            if r["email"] not in st.session_state.recipient_selections:
-                st.session_state.recipient_selections[r["email"]] = True
-
-        total = len(all_recipients)
-        selected_count = sum(
-            1 for r in all_recipients
-            if st.session_state.recipient_selections.get(r["email"], True)
+    elif recipient_mode == "Custom":
+        rtype = "CUSTOM"
+        upload = st.file_uploader(
+            "Upload a CSV or Excel file (optional)", type=dataset.FILE_TYPES,
+            key="custom_list_file",
+            help="Any spreadsheet works — the email column is found automatically and "
+                 "the other columns can be used as filters.",
         )
-        st.info(f"{selected_count} of {total} recipients selected.")
-
-        with st.expander("Preview & select recipients"):
-            # select all / deselect all
-            col_a, col_b, _ = st.columns([1, 1, 4])
-            if col_a.button("Select all", key="sel_all"):
-                for r in all_recipients:
-                    st.session_state.recipient_selections[r["email"]] = True
+        # keep the file while the uploader is off screen (other mode / page);
+        # an empty uploader that was on screen last run means it was removed
+        if upload:
+            st.session_state.custom_file = (upload.name, upload.getvalue())
+        elif custom_uploader_was_shown:
+            st.session_state.pop("custom_file", None)
+        st.session_state.custom_uploader_shown = True
+        list_file = st.session_state.get("custom_file")
+        if list_file and not upload:
+            c1, c2 = st.columns([4, 1])
+            c1.caption(f"Still using **{list_file[0]}** from earlier — upload another "
+                       "file to replace it.")
+            if c2.button("Remove file", key="custom_remove_file"):
+                st.session_state.pop("custom_file", None)
                 st.rerun()
-            if col_b.button("Deselect all", key="desel_all"):
-                for r in all_recipients:
-                    st.session_state.recipient_selections[r["email"]] = False
-                st.rerun()
+        file_recipients = recipient_ui.file_picker(*list_file, "custom") if list_file else []
 
-            # search filter
-            search = st.text_input("Search by name or email", key="recipient_search")
-            filtered = [
-                r for r in all_recipients
-                if search.lower() in r["name"].lower()
-                or search.lower() in r["email"].lower()
-            ] if search else all_recipients
+        raw = st.text_area(
+            "Add more email addresses" if list_file else "Enter email addresses",
+            placeholder="One per line, or comma-separated",
+            height=100 if list_file else 150,
+            key=recipient_ui.keep("custom_typed"),
+        )
+        typed, rejected = dataset.parse_typed_emails(raw)
+        recipients, seen = [], set()
+        for e in file_recipients + typed:
+            if e.lower() not in seen:
+                seen.add(e.lower())
+                recipients.append(e)
 
-            # reset to page 0 when search changes
-            if search != st.session_state.last_search:
-                st.session_state.recipient_page = 0
-                st.session_state.last_search = search
-
-            # pagination
-            PAGE_SIZE = 100
-            total_pages = max(1, -(-len(filtered) // PAGE_SIZE))
-
-            # clamp page in case filtered results shrank
-            st.session_state.recipient_page = min(
-                st.session_state.recipient_page, total_pages - 1
+        if rejected:
+            st.warning(
+                f"Skipped {len(rejected)} typed entr{'y' if len(rejected) == 1 else 'ies'} "
+                f"that aren't valid email addresses: {', '.join(rejected[:10])}"
+                + (" …" if len(rejected) > 10 else "")
             )
-            page_idx = st.session_state.recipient_page
-            page_slice = filtered[page_idx * PAGE_SIZE: (page_idx + 1) * PAGE_SIZE]
-
-            # pagination controls
-            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
-            if pcol1.button("← Prev", key="pg_prev", disabled=page_idx == 0):
-                st.session_state.recipient_page -= 1
-                st.rerun()
-            pcol2.markdown(
-                f"<div style='text-align:center; padding-top:6px'>"
-                f"Page {page_idx + 1} of {total_pages} "
-                f"({len(filtered)} result{'s' if len(filtered) != 1 else ''})"
-                f"</div>",
-                unsafe_allow_html=True,
+        if list_file and typed:
+            added = len(recipients) - len(file_recipients)
+            st.info(
+                f"**{len(recipients)}** recipients in total: {len(file_recipients)} selected "
+                f"from the file + {added} typed"
+                + (f" ({len(typed) - added} typed already in the file)" if len(typed) > added else "")
+                + "."
             )
-            if pcol3.button("Next →", key="pg_next", disabled=page_idx >= total_pages - 1):
-                st.session_state.recipient_page += 1
-                st.rerun()
-
-            # render checkboxes for this page only
-            for r in page_slice:
-                checked = st.session_state.recipient_selections.get(r["email"], True)
-                label = f"{r['name']}  —  {r['email']}" if r["name"] else r["email"]
-                new_val = st.checkbox(label, value=checked, key=f"chk_{r['email']}")
-                if new_val != checked:
-                    st.session_state.recipient_selections[r["email"]] = new_val
-
-        # final recipient list = only checked emails
-        recipients = [
-            r["email"] for r in all_recipients
-            if st.session_state.recipient_selections.get(r["email"], True)
-        ]
+        elif not list_file and raw.strip() and recipients:
+            st.info(f"{len(recipients)} valid email address(es) entered.")
+        elif not list_file and raw.strip() and not recipients:
+            st.warning("No valid email addresses found — check formatting.")
 
     else:
-        rtype = "CUSTOM"
-        raw = st.text_area(
-            "Enter email addresses",
-            placeholder="One per line, or comma-separated",
-            height=150,
-        )
-        recipients = list({
-            e.strip()
-            for e in raw.replace(",", "\n").splitlines()
-            if e.strip() and "@" in e.strip()
-        })
-        if raw and recipients:
-            st.info(f"{len(recipients)} valid email address(es) entered.")
-        elif raw and not recipients:
-            st.warning("No valid email addresses found — check formatting.")
+        rtype = "VERIFIED DISTRIBUTORS"
+        recipients = verified_distributor_recipients()
 
     subject = st.text_input("Subject")
     body = st.text_area("Message body", height=200)
