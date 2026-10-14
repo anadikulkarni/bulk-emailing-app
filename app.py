@@ -285,7 +285,8 @@ if page == "Compose & Send":
 
         if rejected:
             shown = [
-                f"{r} (did you mean {fix}?)" if (fix := dataset.suggest_cell_fix(r)) else r
+                f"{r} (did you mean {', '.join(f for f, _ in fixes)}?)"
+                if (fixes := dataset.suggest_cell_fixes(r)) else r
                 for r in rejected[:10]
             ]
             st.warning(

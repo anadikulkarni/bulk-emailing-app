@@ -216,21 +216,24 @@ def _corrections(full, result, t):
     if not fixes and not full["fixable"]:
         return recipients
     rows = [{"Name": r["name"], "In file": r["fixed_from"], "Suggested": r["email"],
-             "Problem": "spaces in address"} for r in result["fixable"]]
+             "Problem": r["problem"]} for r in result["fixable"]]
     rows += [{"Name": r["name"], "In file": r["email"], "Suggested": fixes[r["key"]],
-              "Problem": "misspelt domain"} for r in recipients if r["key"] in fixes]
+              "Problem": ("text after .com" if r["email"].lower().startswith(fixes[r["key"]].lower())
+                          else "misspelt domain")}
+             for r in recipients if r["key"] in fixes]
     n = len(rows)
     title = (f"🔤 {n} address{'es' if n != 1 else ''} can probably be corrected — "
-             "misspelt domains (gmai.com) or stray spaces (gmail. com)" if rows
+             "misspelt domains, stray spaces, missing @ or .com …" if rows
              else "🔤 Corrections: none needed in the filtered rows")
     with st.expander(title):
         if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.dataframe(pd.DataFrame(rows)[["In file", "Suggested", "Problem", "Name"]],
+                         hide_index=True, width="stretch")
         use_fixes = st.checkbox("Send to the suggested addresses instead",
                                 key=keep(f"{t}_typo_fix"))
-        st.caption("Misspelt domains would bounce; addresses with spaces aren't sent at "
-                   "all unless corrected. Corrected addresses are marked ✏️ in the list "
-                   "below, where any of them can still be unticked.")
+        st.caption("Misspelt domains would bounce; invalid addresses aren't sent at all "
+                   "unless corrected. Corrected addresses are marked ✏️ in the list below, "
+                   "where any of them can still be unticked.")
     if not use_fixes:
         return recipients
     fixed, seen = [], {r["email"].lower() for r in recipients if r["key"] not in fixes}
