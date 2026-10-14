@@ -136,3 +136,54 @@ def log_emails_bulk(records):
             records,
         )
         conn.commit()
+
+# ---------- Verified distributors list ----------
+# Every upload is kept; the newest one is the list in use.
+VERIFIED_LISTS_DDL = (
+    "IF OBJECT_ID('VERIFIED_DISTRIBUTOR_LISTS', 'U') IS NULL "
+    "CREATE TABLE VERIFIED_DISTRIBUTOR_LISTS ("
+    "id INT IDENTITY(1,1) PRIMARY KEY, "
+    "filename NVARCHAR(260) NOT NULL, "
+    "file_data VARBINARY(MAX) NOT NULL, "
+    "row_count INT NOT NULL, "
+    "uploaded_by NVARCHAR(100) NOT NULL, "
+    "uploaded_at DATETIME2 NOT NULL DEFAULT SYSDATETIME())"
+)
+_verified_table_ready = False
+
+def _ensure_verified_table(conn):
+    global _verified_table_ready
+    if not _verified_table_ready:
+        conn.cursor().execute(VERIFIED_LISTS_DDL)
+        conn.commit()
+        _verified_table_ready = True
+
+def get_verified_list_meta():
+    """Newest verified distributors upload (without the file), or None."""
+    with get_conn_ctx() as conn:
+        _ensure_verified_table(conn)
+        cursor = conn.cursor(as_dict=True)
+        cursor.execute(
+            "SELECT TOP 1 id, filename, row_count, uploaded_by, uploaded_at "
+            "FROM VERIFIED_DISTRIBUTOR_LISTS ORDER BY id DESC"
+        )
+        return cursor.fetchone()
+
+def get_verified_list_data(list_id):
+    with get_conn_ctx() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT file_data FROM VERIFIED_DISTRIBUTOR_LISTS WHERE id = %s", (list_id,)
+        )
+        return bytes(cursor.fetchone()[0])
+
+def save_verified_list(filename, file_bytes, row_count, uploaded_by):
+    with get_conn_ctx() as conn:
+        _ensure_verified_table(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO VERIFIED_DISTRIBUTOR_LISTS "
+            "(filename, file_data, row_count, uploaded_by) VALUES (%s,%s,%s,%s)",
+            (filename, file_bytes, row_count, uploaded_by)
+        )
+        conn.commit()
