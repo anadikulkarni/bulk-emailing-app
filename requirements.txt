@@ -4,3 +4,4 @@ pymssql
 pandas
 openpyxl
 xlrd
+tzdata

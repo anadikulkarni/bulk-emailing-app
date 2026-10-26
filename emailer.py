@@ -7,6 +7,10 @@ import streamlit as st
 for key, value in st.secrets.items():
     os.environ[key] = str(value)
 
+# Google Workspace allows about 2,000 messages a day per user; this leaves room
+# for the account's normal mail
+DAILY_CAP = 1800
+
 def _build_message(to_addr, subject, body, attachment_name=None, attachment_bytes=None):
     msg = EmailMessage()
     msg["From"] = f"{os.environ.get('SENDER_NAME','')} <{os.environ['GMAIL_ADDRESS']}>"
@@ -31,7 +35,9 @@ def _connect():
     return server
 
 def send_bulk(recipients, subject, body, attachment_name=None, attachment_bytes=None,
-              progress_cb=None):
+              progress_cb=None, on_result=None):
+    """Send one email per recipient. Returns (address, "SENT"/"FAILED", error)
+    tuples; on_result, if given, gets each tuple as soon as that email is done."""
     results = []
     delay = float(os.environ.get("SEND_DELAY_SECONDS", "1"))
     RECONNECT_EVERY = 100
@@ -68,6 +74,8 @@ def send_bulk(recipients, subject, body, attachment_name=None, attachment_bytes=
         except Exception as e:
             results.append((addr, "FAILED", str(e)))
 
+        if on_result:
+            on_result(*results[-1])
         if progress_cb:
             progress_cb(i + 1, len(recipients))
         time.sleep(delay)

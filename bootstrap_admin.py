@@ -1,7 +1,7 @@
 import getpass
 from auth import create_user, list_users
 
-if any(u.role == "admin" for u in list_users()):
+if any(u["role"] == "admin" for u in list_users()):
     print("An admin already exists. Aborting.")
 else:
     username = input("Admin username: ").strip()

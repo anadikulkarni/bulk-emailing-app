@@ -7,7 +7,9 @@ import os
 import json
 import uuid
 import time
-from emailer import send_bulk
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from emailer import send_bulk, DAILY_CAP
 
 # Push Streamlit secrets into os.environ
 for key, value in st.secrets.items():
@@ -15,7 +17,12 @@ for key, value in st.secrets.items():
 
 st.set_page_config(page_title="Bulk Email Sender", page_icon="📧")
 
-DAILY_CAP = 1800
+# Scheduled times are picked and shown in this zone, and stored in UTC
+APP_TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Kolkata"))
+
+def local_time(utc_naive):
+    """A naive UTC datetime from the database, in APP_TZ."""
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone(APP_TZ)
 
 # ---------- Session / login ----------
 def login_screen():
@@ -218,7 +225,48 @@ def verified_distributor_recipients():
                      "(row numbers match the file that was uploaded).",
     )
 
-pages = ["Compose & Send", "Pending Sends", "Activity Log"]
+def schedule_controls(rtype, recipients, subject, body, att_name, att_bytes, can_send):
+    """Date and time pickers, and the button that queues the email for later."""
+    now = datetime.now(APP_TZ)
+    if "schedule_default" not in st.session_state:
+        # the next whole hour, fixed once so the pickers don't move on every rerun
+        st.session_state.schedule_default = (now + timedelta(hours=1)).replace(
+            minute=0, second=0, microsecond=0)
+    default = st.session_state.schedule_default
+    c1, c2 = st.columns(2)
+    send_date = c1.date_input("Send on", value=default.date(), min_value=now.date(),
+                              key="schedule_date")
+    send_time = c2.time_input("At", value=default.time(), step=timedelta(minutes=15),
+                              key="schedule_time")
+    send_at = datetime.combine(send_date, send_time, tzinfo=APP_TZ)
+    st.caption(
+        f"Times are in {APP_TZ.key}. The emails go out within a few minutes of that time, "
+        f"up to {DAILY_CAP} in any 24 hours; any more follow automatically as the "
+        "allowance frees up."
+    )
+
+    # stops a second click scheduling the same email twice
+    fingerprint = (rtype, subject, body, att_name, tuple(recipients), send_at)
+    already = st.session_state.get("last_scheduled") == fingerprint
+    if already:
+        st.success(f"Scheduled for {send_at:%d %b %Y, %H:%M}. Follow or cancel it under "
+                   "Scheduled Sends.")
+    if st.button("Schedule send", type="primary", disabled=not can_send or already):
+        if send_at <= now:
+            st.error("Pick a time in the future.")
+            return
+        try:
+            db.schedule_send(
+                rtype, subject, body, att_name, att_bytes, recipients,
+                send_at.astimezone(timezone.utc).replace(tzinfo=None), user["username"],
+            )
+        except Exception as e:
+            st.error(f"Couldn't schedule the send: {e}")
+            return
+        st.session_state.last_scheduled = fingerprint
+        st.rerun()
+
+pages = ["Compose & Send", "Scheduled Sends", "Pending Sends", "Activity Log"]
 if user["role"] == "admin":
     pages.append("Admin")
 page = st.sidebar.radio("Navigate", pages)
@@ -320,7 +368,14 @@ if page == "Compose & Send":
     over_cap = len(recipients) > DAILY_CAP
     can_send = bool(recipients and subject and body)
 
-    if over_cap:
+    when = st.radio(
+        "When", ["Send now", "Schedule for later"], horizontal=True, key="send_when",
+        disabled=st.session_state.confirm_send or st.session_state.sending,
+    )
+    if when == "Schedule for later":
+        schedule_controls(rtype, recipients, subject, body, att_name, att_bytes, can_send)
+
+    if when == "Send now" and over_cap:
         st.warning(
             f"⚠️ {len(recipients)} recipients exceeds the daily cap of {DAILY_CAP}. "
             f"The first **{DAILY_CAP}** will be sent now and the remaining "
@@ -329,7 +384,7 @@ if page == "Compose & Send":
 
     btn_label = f"Send first {DAILY_CAP} now & save remainder" if over_cap else "Send now"
 
-    if not st.session_state.confirm_send and not st.session_state.sending:
+    if when == "Send now" and not st.session_state.confirm_send and not st.session_state.sending:
         if st.button(btn_label, type="primary", disabled=not can_send):
             st.session_state.staged = {
                 "rtype": rtype,
@@ -415,6 +470,53 @@ if page == "Compose & Send":
 
             st.session_state.sending = False
             st.session_state.staged = None
+
+# ---------- Scheduled Sends ----------
+elif page == "Scheduled Sends":
+    st.header("Scheduled Sends")
+    st.caption(
+        "Scheduled emails are sent by `scheduler_worker.py`, which has to run every few "
+        "minutes on a machine that can reach the database (for example with Windows "
+        f"Task Scheduler). Times are in {APP_TZ.key}."
+    )
+
+    flash = st.session_state.pop("scheduled_flash", None)
+    if flash:
+        st.info(flash)
+
+    try:
+        sends = db.get_scheduled_sends()
+    except Exception as e:
+        st.error(f"Couldn't load scheduled sends: {e}")
+        sends = []
+    if not sends:
+        st.info("Nothing scheduled. Choose “Schedule for later” on Compose & Send.")
+
+    status_labels = {"PENDING": "⏰ Scheduled", "SENDING": "📤 Sending",
+                     "SENT": "✅ Sent", "CANCELLED": "🚫 Cancelled"}
+    overdue_before = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15)
+    for s in sends:
+        active = s["status"] in ("PENDING", "SENDING")
+        with st.expander(
+            f"{status_labels.get(s['status'], s['status'])} · "
+            f"{local_time(s['send_at']):%d %b %Y, %H:%M} · {s['subject']}",
+            expanded=active,
+        ):
+            st.write(
+                f"**Recipients:** {s['recipient_count']} ({s['retailer_type']}) · "
+                f"**sent so far:** {s['sent_count']} · **scheduled by:** {s['created_by']}"
+            )
+            if s["result_summary"]:
+                st.caption(s["result_summary"])
+            if s["status"] == "PENDING" and not s["result_summary"] and s["send_at"] < overdue_before:
+                st.warning("This is overdue. Check that scheduler_worker.py is running.")
+            if s["status"] == "PENDING" and st.button("Cancel this send", key=f"cancel_sched_{s['id']}"):
+                if db.cancel_scheduled_send(s["id"]):
+                    st.session_state.scheduled_flash = f"Cancelled “{s['subject']}”."
+                else:
+                    st.session_state.scheduled_flash = (
+                        f"Too late to cancel “{s['subject']}”: it has started sending.")
+                st.rerun()
 
 # ---------- Pending Sends ----------
 elif page == "Pending Sends":
